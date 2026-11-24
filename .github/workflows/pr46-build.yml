@@ -1,0 +1,65 @@
+name: PR46 debug IPK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr46-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-build:
+    name: Build exact PR46 head
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact PR head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: pr46
+          fetch-depth: 0
+
+      - name: Verify commit identity
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "0fdf4a601eb4a4a9e39426dc7430deb06ba9dad6"
+          echo "PR46_HEAD=$actual"
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - id: ndk
+        uses: ./.github/actions/webos-ndk
+
+      - name: Build ARM binary
+        run: make WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' -j"$(nproc)"
+
+      - name: Package debug IPK
+        run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
+
+      - name: ELF assertions
+        run: ./ci/check-elf.sh
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+
+      - name: Packaging assertions
+        run: python3 ci/check-package.py
+        env:
+          REQUIRE_PACKAGE: "1"
+
+      - name: Record package hash
+        run: sha256sum pkg/*.ipk
+
+      - name: Upload debug IPK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nativejelly-0fdf4a601eb4a4a9e39426dc7430deb06ba9dad6
+          path: pkg/*.ipk
+          if-no-files-found: error
+          retention-days: 30
