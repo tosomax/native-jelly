@@ -1182,6 +1182,27 @@ fn with_dts_info(p: &str, audio: &str, channels: i64) -> String {
     p.replace(anchor, &format!(r#"{anchor},"dtsInfo":{{"channels":{ch},"sampleRate":48.0}}"#))
 }
 
+/// EXPERIMENT (`swdec`): force `option.useSoftwareAudioDecoder=true` into the Load.
+///
+/// The key lives in `option` — the same object as `appId` and `externalStreamingInfo` — and not
+/// in `contents`: `libplayerAPIs::parseLoadMessage` reads it as an option. It is spliced before
+/// `externalStreamingInfo`, i.e. after `appId` (which the window splice also anchors on), so the
+/// payload keeps its key order and `appId` stays first.
+///
+/// Pure and idempotent: a payload that already carries the key is returned unchanged, and a
+/// payload without exactly one `externalStreamingInfo` anchor is left alone rather than being
+/// made invalid. `on == false` is the shipped path, byte for byte.
+fn with_software_audio_decoder(p: &str, on: bool) -> String {
+    if !on || p.contains(r#""useSoftwareAudioDecoder""#) {
+        return p.to_string();
+    }
+    let anchor = r#""externalStreamingInfo":{"#;
+    if p.matches(anchor).count() != 1 {
+        return p.to_string();
+    }
+    p.replacen(anchor, &format!(r#""useSoftwareAudioDecoder":true,{anchor}"#), 1)
+}
+
 /// The `PCM` declaration DTS passthrough uses: LG's 2-channel 48 kHz S16 input, the one PCM shape
 /// libpf's tables name (`LUT_ChannelModeType` stops at stereo, `LUT_SampleRateType` at 48 kHz) and
 /// the IEC 61937 carrier of a DTS core. Declared as `DTS`, the C1 (webOS 6) refuses the Load with
@@ -1824,7 +1845,25 @@ fn start_bufferfeed_inner(
     // ...and the appId substitution happens here for the same reason, and BEFORE the splice —
     // `with_window_id`'s anchor is the composed `"appId":"<id>"`, so the placeholder has to be
     // gone by then.
-    let payload_c = std::ffi::CString::new(with_window_id(pa.mt(), &with_app_id(payload_str))).unwrap();
+    // EXPERIMENT (`swdec`, o24n): `option.useSoftwareAudioDecoder=true`, only on a Load that
+    // declares a DTS-family audio — i.e. the `acodec` experiment's native declaration. The AC3
+    // fallback that currently allocates stays exactly as it was. Armed on the debug install by
+    // `nativejelly-swdec` (presence, or anything but an explicit false) with `NJ_PLATFORMFIX=0`
+    // as the kill switch; see `nj_base::platformfix`.
+    let swdec = matches!(audio_declared, "DTS" | "DTSX" | "DTSE")
+        && nj_base::platformfix::enabled();
+    if swdec {
+        #[cfg(feature = "devtriggers")]
+        log(&format!(
+            "load: swdec ON — option.useSoftwareAudioDecoder=true for a={audio_declared} (nativejelly-swdec; interposer {})",
+            if nj_base::platformfix::interposer_mapped() { "mapped" } else { "NOT mapped" }
+        ));
+    }
+    let payload_c = std::ffi::CString::new(with_window_id(
+        pa.mt(),
+        &with_software_audio_decoder(&with_app_id(payload_str), swdec),
+    ))
+    .unwrap();
     if stream {
         // What the payload ACTUALLY declared, once, in the event log. Not test scaffolding: until
         // this line, the only answer to "what did we tell the television this stream was" lived in
@@ -3884,6 +3923,93 @@ mod payload_tests {
             el_present: false,
             ..Dovi::NONE
         }
+    }
+
+    /// `swdec` off is the shipped payload, byte for byte: no key, no reformatting.
+    #[test]
+    fn swdec_is_off_by_default() {
+        for (name, p) in [
+            ("PAYLOAD_V", PAYLOAD_V),
+            ("PAYLOAD_AV", PAYLOAD_AV),
+            ("PAYLOAD_H265", PAYLOAD_H265),
+        ] {
+            assert_eq!(super::with_software_audio_decoder(p, false), p, "{name}");
+            assert!(!p.contains("useSoftwareAudioDecoder"), "{name}");
+        }
+    }
+
+    /// Armed: exactly one `option.useSoftwareAudioDecoder:true`, inside `option` (not
+    /// `contents`), with `appId` still the first key and the whole payload still valid JSON.
+    #[test]
+    fn swdec_splices_one_well_formed_option_key() {
+        for (name, p) in [
+            ("PAYLOAD_V", PAYLOAD_V),
+            ("PAYLOAD_AV", PAYLOAD_AV),
+            ("PAYLOAD_H265", PAYLOAD_H265),
+        ] {
+            let spliced = super::with_software_audio_decoder(p, true);
+            assert_eq!(
+                spliced.matches(r#""useSoftwareAudioDecoder":true"#).count(),
+                1,
+                "{name}: exactly one key"
+            );
+            assert!(
+                spliced.contains(r#""option":{"appId":"@APPID@","useSoftwareAudioDecoder":true,"#),
+                "{name}: the key goes inside option and appId stays first"
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&spliced).unwrap_or_else(|e| panic!("{name}: invalid JSON: {e}"));
+            assert_eq!(
+                value["args"][0]["option"]["useSoftwareAudioDecoder"],
+                serde_json::Value::Bool(true),
+                "{name}: option.useSoftwareAudioDecoder"
+            );
+            assert!(
+                value["args"][0]["option"]["externalStreamingInfo"]["contents"]
+                    .get("useSoftwareAudioDecoder")
+                    .is_none(),
+                "{name}: the key must not land in contents"
+            );
+        }
+    }
+
+    /// Applying the splice twice is the same payload as once, and a payload that already names
+    /// the key (whatever its value) is never rewritten.
+    #[test]
+    fn swdec_is_idempotent() {
+        let once = super::with_software_audio_decoder(PAYLOAD_AV, true);
+        let twice = super::with_software_audio_decoder(&once, true);
+        assert_eq!(once, twice);
+
+        let manual = PAYLOAD_AV.replace(
+            r#""externalStreamingInfo":{"#,
+            r#""useSoftwareAudioDecoder":false,"externalStreamingInfo":{"#,
+        );
+        assert_eq!(
+            super::with_software_audio_decoder(&manual, true),
+            manual,
+            "an existing key must not be replaced"
+        );
+    }
+
+    /// Nothing else in `option` moves: the spliced payload is the original plus exactly one
+    /// boolean, which is what "without touching other options" means.
+    #[test]
+    fn swdec_leaves_every_other_option_untouched() {
+        let before: serde_json::Value = serde_json::from_str(PAYLOAD_AV).unwrap();
+        let spliced = super::with_software_audio_decoder(PAYLOAD_AV, true);
+        let after: serde_json::Value = serde_json::from_str(&spliced).unwrap();
+        let mut expected = before;
+        expected["args"][0]["option"]["useSoftwareAudioDecoder"] = serde_json::Value::Bool(true);
+        assert_eq!(after, expected);
+    }
+
+    /// No anchor means no splice rather than a payload broken by a blind `replace`.
+    #[test]
+    fn swdec_needs_exactly_one_option_anchor() {
+        assert_eq!(super::with_software_audio_decoder("{}", true), "{}");
+        let twice = r#"{"option":{"a":1,"externalStreamingInfo":{},"b":{"externalStreamingInfo":{}}}}"#;
+        assert_eq!(super::with_software_audio_decoder(twice, true), twice);
     }
 
     /// A declared Profile 8.1 direct play whose declaration the route withdrew (upstream #1166)

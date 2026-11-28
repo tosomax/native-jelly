@@ -46,6 +46,10 @@ static PORT: nj_platform::tv::Port = nj_platform::tv::Port {
 /// hand over to `app::run_application`.
 #[no_mangle]
 pub extern "C" fn nj_run(pms_host: *const c_char, pms_port: c_int) -> c_int {
+    // EXPERIMENT (`swdec`): the o24n whitelist interposer has to be present at `exec`, because
+    // libplayerAPIs is linked BIND_NOW and a later dlopen cannot rebind its PLT slots. One
+    // re-exec, armed only on the debug install, before SDL/ACB or any worker exists.
+    nj_base::platformfix::maybe_reexec();
     let _ = nj_platform::tv::install(&PORT);
     #[cfg(target_os = "linux")]
     let _ = nj_platform::storage::client::install_activator(nj_platform::webos::activate_storage_helper);

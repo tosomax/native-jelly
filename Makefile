@@ -712,7 +712,7 @@ RUST_LIB    = rust-modules/$(RUST_TDIR)/$(RUST_TARGET)/release/libnativejelly_mo
 SRCS = $(filter-out src/gpdebug.c src/ass.c,$(wildcard src/*.c)) src/compat/getauxval.c
 OBJS = $(SRCS:.c=.o)
 
-all: pkg/nativejelly pkg/nativejelly-storage
+all: pkg/nativejelly pkg/nativejelly-storage $(PLATFORMFIX_FILES)
 
 # per-file compile; each object depends on ALL headers so a header edit rebuilds all, plus the
 # config.local.h presence/hash stamp so its appearance, change or disappearance also rebuilds
@@ -767,6 +767,22 @@ $(LIBASS_STAGED): $(LIBASS_INPUTS)
 	WEBOS_SDK=$(WEBOS_SDK) ./ci/build-libass.sh
 
 libass: $(LIBASS_STAGED)
+
+# --- libplatformfix.so: the o24n software-audio whitelist interposer (EXPERIMENT) ---------------
+# Debug install only and never a release build. The app loads it from its own install directory by
+# re-exec'ing once with LD_PRELOAD (`rust-modules/base/src/platformfix.rs`), and only the
+# `nativejelly-swdec` trigger arms that. A package without this file therefore cannot arm
+# anything, and nothing here is system-wide: no /etc/ld.so.preload, no library search path.
+PLATFORMFIX_SRC   = interposer/platformfix.cpp
+PLATFORMFIX_SO    = pkg/libplatformfix.so
+PLATFORMFIX_FILES = $(if $(filter debug,$(FLAVOR)),$(if $(RELEASE),,$(PLATFORMFIX_SO)),)
+
+$(PLATFORMFIX_SO): $(PLATFORMFIX_SRC) Makefile ci/arm-cc.py ci/check-link-evidence.py
+	@mkdir -p pkg
+	NJ_ARM_CXX=1 $(CC) --sysroot=$(SYSROOT) -O2 -fPIC -shared -fno-omit-frame-pointer \
+	  -Wall -Wextra $(WERROR) -D_GLIBCXX_USE_CXX11_ABI=1 -o $@ $(PLATFORMFIX_SRC) -ldl
+
+platformfix: $(PLATFORMFIX_SO)
 
 # Sentry Native supplies only the async-signal-safe capture and out-of-process ARM stack walk. Its
 # HTTP transport is compiled out: the resulting envelope is handed back to this executable in
@@ -1027,7 +1043,7 @@ LAB_FILES = $(if $(LAB),pkg/lab.json,)
 APP_FILES = pkg/nativejelly $(SENTRY_HANDLER) $(APPINFO) $(ICONS) pkg/splash.png \
             pkg/appfont.ttf pkg/appfont-bold.ttf pkg/appfont-cjk.ttf pkg/OFL.txt \
             THIRD-PARTY-NOTICES.md LICENSING.md \
-            $(LAB_FILES) \
+            $(LAB_FILES) $(PLATFORMFIX_FILES) \
             $(FFMPEG_STAGED) $(LIBASS_STAGED)
 
 # Everything `deploy` scp's as a PLAIN file, in one connection — the SAME set `ipk` stages via
@@ -1088,7 +1104,7 @@ pkg/.flavor/$(FLAVOR)/appinfo.json: pkg/appinfo.json ci/flavor.py ci/install-ide
 # prerequisites run left to right, and a cold `make deploy` spends ~2 minutes building FFmpeg
 # before it touches the television. Taking the lock first would hold the set through a build that
 # needs no television — and, on the short implicit lease, could even let it expire before the scp.
-deploy: pkg/nativejelly pkg/nativejelly-storage $(FFMPEG_STAGED) $(SENTRY_NATIVE_STAMP) $(APPINFO) release-guard tv-lock-require
+deploy: pkg/nativejelly pkg/nativejelly-storage $(FFMPEG_STAGED) $(SENTRY_NATIVE_STAMP) $(APPINFO) $(PLATFORMFIX_FILES) release-guard tv-lock-require
 	@echo "deploying $(if $(RELEASE),RELEASE,dev) build ($(RUST_CFG)) to $(APPID) [$(FLAVOR)]"
 	@$(SSH) 'test -d $(APPDIR)' || { \
 	  echo "$(APPDIR) does not exist on the TV — the $(FLAVOR) flavour is not installed."; \
@@ -1737,8 +1753,8 @@ sentry-symbols: symbols
 	@SENTRY_ORG='$(SENTRY_ORG)' SENTRY_PROJECT='$(SENTRY_PROJECT)' \
 	  $(SENTRY_CLI) debug-files upload --include-sources pkg/nativejelly.debug pkg/nativejelly
 
-ipk: pkg/nativejelly pkg/nativejelly-storage $(APPINFO) release-guard
-	python3 ci/check-link-evidence.py pkg/nativejelly pkg/nativejelly-storage $(SENTRY_HANDLER) $(FFMPEG_STAGED) $(LIBASS_STAGED)
+ipk: pkg/nativejelly pkg/nativejelly-storage $(APPINFO) $(PLATFORMFIX_FILES) release-guard
+	python3 ci/check-link-evidence.py pkg/nativejelly pkg/nativejelly-storage $(SENTRY_HANDLER) $(FFMPEG_STAGED) $(LIBASS_STAGED) $(PLATFORMFIX_FILES)
 	@echo "packaging $(if $(RELEASE),RELEASE,dev) build ($(RUST_CFG)) as $(APPID) [$(FLAVOR)]"
 	rm -rf ipkroot/data/usr && mkdir -p $(STAGE)/licenses
 	cp $(APP_FILES) $(STAGE)/
@@ -1751,8 +1767,12 @@ ipk: pkg/nativejelly pkg/nativejelly-storage $(APPINFO) release-guard
 	@# stripping in place would break the identity check and lose function names from every
 	@# release crash report. Deploy ships the unstripped one by design; only the ipk is stripped.
 	$(TOOLPREFIX)strip --strip-unneeded $(STAGE)/nativejelly
+	@# The debug-only interposer is stripped the same way, so `stage-link-evidence --stripped`
+	@# can assert the transformation instead of trusting a copy.
+	@if [ -n "$(PLATFORMFIX_FILES)" ]; then \
+	  $(TOOLPREFIX)strip --strip-unneeded $(STAGE)/libplatformfix.so; fi
 	rm -rf pkg/link-evidence/$(FLAVOR)
-	@for source in pkg/nativejelly $(SENTRY_HANDLER) $(FFMPEG_STAGED) $(LIBASS_STAGED); do \
+	@for source in pkg/nativejelly $(SENTRY_HANDLER) $(FFMPEG_STAGED) $(LIBASS_STAGED) $(PLATFORMFIX_FILES); do \
 	  python3 ci/stage-link-evidence.py "$$source" "$(STAGE)/$$(basename "$$source")" --stripped \
 	    --evidence-base "pkg/link-evidence/$(FLAVOR)/$$(basename "$$source")" || exit $$?; \
 	done

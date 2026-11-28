@@ -26,6 +26,7 @@ pub mod fontcov; // which codepoints a font file can draw, read from its cmap
 pub mod surface; // what we are actually drawing into: drawable vs the 1920x1080 logical canvas
 pub mod tile; // `Tile`: the shelf-tile trait the data layer implements and `ui` draws through
 pub mod devtrig; // the /tmp trigger PRIMITIVES (`flag`, `read`, `latched_flag!`, `no_wan`...)
+pub mod platformfix; // EXPERIMENT (`swdec`): the o24n software-audio gate and its one re-exec
 pub mod diag; // the frame instruments (`heartbeat`, `spans`) and the zlib helper
 #[cfg(any(test, feature = "test-support"))]
 pub mod testlock; // one lock for every test that touches a process-global
