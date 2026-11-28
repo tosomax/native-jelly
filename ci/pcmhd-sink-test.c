@@ -4,6 +4,13 @@
  * target callsite or LG sink semantics; the runtime CAPS handshake covers a missing callsite by
  * refusing to feed. Build/run command: ci/test-pcmhd-sink.sh (not run by the source-only lane).
  */
+/* pcmhd_sink.c needs clock_gettime/CLOCK_MONOTONIC, which glibc only declares when
+ * _GNU_SOURCE is set before the FIRST system header is included. This harness includes
+ * system headers before it includes the interposer source, so define the guard here;
+ * the identical guard in pcmhd_sink.c remains for standalone compilation. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <assert.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -347,7 +354,7 @@ static void test_caps_false_absent_nonboolean_incomplete_and_complete(void) {
     assert(invoke_caps(&st) == PCMHD_PROBE_DROP);
     assert(send_calls == 1 && ready_calls == 1 && refused_calls == 0);
     assert(last_sent == &replacement_event && last_sent->caps == &carrier_caps);
-    assert(nested_return == PCMHD_PROBE_OK, "nested carrier CAPS must pass through");
+    assert(nested_return == PCMHD_PROBE_OK); /* nested carrier CAPS must pass through */
     nj_pcmhd_disarm();
   }
 
@@ -375,7 +382,7 @@ static void test_rejected_replacement_preserves_original_and_refuses_feed(void) 
   send_result = 0;
   GstStructure st;
   base_caps(&st, 0);
-  assert(invoke_caps(&st) == PCMHD_PROBE_OK, "the original CAPS must not be dropped");
+  assert(invoke_caps(&st) == PCMHD_PROBE_OK); /* the original CAPS must not be dropped */
   assert(send_calls == 1 && refused_calls == 1 && ready_calls == 0 && armed == 0);
   nj_pcmhd_disarm();
 }
