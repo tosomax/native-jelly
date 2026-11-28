@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ci-dts-pcm-fixed-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep a running host suite alive when a follow-up fix is pushed; the newer run queues.
+  cancel-in-progress: false
 
 jobs:
   host-tests:
