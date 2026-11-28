@@ -118,6 +118,10 @@ La revisione non legge più `GstPadProbeInfo.data` o `GstEvent.type` a offset ha
   `G_OBJECT_GET_CLASS`/`G_TYPE_INSTANCE_GET_CLASS` non sono simboli esportati e non vengono risolte;
 - `gst_structure_get_boolean/int/uint/uint64/string()` per validare i campi;
 - `gst_pad_remove_probe()` con il prototipo pubblico `void`.
+- `gst_object_get_name()` per il nome del factory nel wrapper `create`: è un simbolo esportato da
+  `libgstreamer-1.0.so.0` (verificato con `readelf --dyn-syms` sulla libgstreamer dell'host), mentre
+  `GST_PLUGIN_FEATURE_NAME`/`GST_OBJECT_NAME` sono macro e `gst_plugin_feature_get_name` non esiste
+  come simbolo. La copia restituita viene liberata con `g_free` di libglib.
 
 Restano numeriche solo le costanti pubbliche `GstPadProbeType` e `GstPadProbeReturn` usate dalla
 probe (0x140, OK=0, DROP=1). La semantica del sink LG e il suo parsing delle caps restano non
@@ -128,17 +132,28 @@ donor, non dimostra il comportamento del renderer.
 
 ## 3. Interposizione e artefatto
 
-- `Makefile` compila `src/pcmhd_sink.c` ed esporta `gst_element_factory_make` solo se
-  `devtriggers` è nel set di feature effettivo.
-- `ci/check-elf.sh` riceve `PCMHD_HOOK=1` per il job dev e richiede l'export esattamente una volta;
-  con `PCMHD_HOOK=0` richiede che il simbolo sia assente.
-- Il gate ELF prova l'export, **non** il callsite di libpf. Se libpf usasse
-  `gst_element_factory_create` o una risoluzione non interponibile, l'handshake non diventerebbe
-  pronto e il carrier non verrebbe alimentato.
+- `Makefile` compila `src/pcmhd_sink.c` ed esporta `gst_element_factory_make` e
+  `gst_element_factory_create` solo se `devtriggers` è nel set di feature effettivo.
+- `ci/check-elf.sh` riceve `PCMHD_HOOK=1` per il job dev e richiede che **entrambi** gli export
+  siano presenti esattamente una volta; con `PCMHD_HOOK=0` richiede che siano assenti.
+- Il gate ELF prova gli export, **non** il callsite di libpf: per questo la build diagnostica
+  intercetta entrambi i factory e registra ogni ingresso. Se libpf usasse una risoluzione non
+  interponibile, l'handshake non diventerebbe pronto e il carrier non verrebbe alimentato.
+- Entrambi i wrapper fanno forwarding incondizionato alla funzione reale risolta con
+  `dlsym(RTLD_NEXT, …)`; solo con modo armato, sessione corrente e factory `audiosink` (verificato
+  con il pubblico `gst_object_get_name`, esportato da libgstreamer — a differenza della macro
+  `GST_PLUGIN_FEATURE_NAME`) installano la **stessa** `install_locked()`. La copia restituita da
+  `gst_object_get_name` è tenuta in cache per factory e liberata con `g_free` a cambio sessione o
+  disarmo. Non c'è logica caps o feed duplicata nel percorso `create`.
+- Un guard thread-local copre **solo il forwarding** della `make` reale: se la `make` reale chiama
+  internamente `gst_element_factory_create`, quella `create` annidata viene solo risolta e
+  forwardata — nessun contatore, nessuna riga `HOOK create`, nessuna installazione. Una `create`
+  diretta di libpf resta invece pienamente tracciata. Senza questo guard, una sola `make` di libpf
+  sembrerebbe anche una `create` e la probe verrebbe installata due volte.
 - `ci/pcmhd-sink-test.c` è un harness host con `dlopen/dlsym` link-wrapped: prova il forwarding
-  disarmato, la separazione dei simboli, caps `es` false/incomplete, rifiuto CAPS, refcount del pad e
-  disarmo. `ci/test-pcmhd-sink.sh` contiene il comando di build/run; **non è stato eseguito** in
-  questa lane.
+  disarmato di entrambi i factory, la separazione dei simboli, le righe `HOOK make`/`HOOK create`,
+  caps `es` false/incomplete, rifiuto CAPS, refcount del pad e disarmo. `ci/test-pcmhd-sink.sh`
+  contiene il comando di build/run; **non è stato eseguito** in questa lane (host senza `cc`).
 
 ---
 
@@ -149,7 +164,10 @@ donor, non dimostra il comportamento del renderer.
 - `load: ... a="PCM" ...`;
 - `start_bufferfeed: PCM carrier armed ... waiting for accepted sink CAPS`;
 - `ff: PCM carrier ...`;
-- in caso di rifiuto: `PCM carrier refused ...` e nessun feed carrier.
+- in caso di rifiuto: `PCM carrier refused — sink did not accept carrier CAPS;
+  hook_calls=N create_calls=M; no carrier bytes fed` e nessun feed carrier;
+- dalla build diagnostica: righe `pcmhd-sink: HOOK make factory=… armed=… session=…` e
+  `pcmhd-sink: HOOK create factory=… armed=… session=…`, una per factory/sessione.
 
 Con `pcmhd` o `pcmhd-force` armati, ogni start registra una riga
 `start_bufferfeed: PCM carrier gates:` con: major webOS reale, major richiesto (25), force
@@ -159,7 +177,12 @@ anche quando il carrier non si arma prima del receiver: è questa la riga che ma
 `9607c2e3` e che distingue un gate firmware falso da un caps/receiver falsi. Nessuna riga aggiuntiva
 viene scritta per uno start ordinario senza trigger.
 
-`/tmp/nativejelly-pcmhd-sink.log`:
+Ogni riga di `sink_log()` viene scritta **prima** nel log eventi tramite l'export Rust
+`nj_pcmhd_hooks_log()` (che usa `nj_base::eventlog::log`) e solo dopo, come copia secondaria, nel
+vecchio `/tmp/nativejelly-pcmhd-sink.log`. Un `fopen()` fallito non può più cancellare la diagnosi.
+Il prefisso `pcmhd-sink:` distingue queste righe dal resto del log eventi.
+
+`/tmp/nativejelly-pcmhd-sink.log` (copia secondaria):
 
 - `symbols resolved through public GStreamer/GObject APIs`;
 - `audiosink found: probe ...`;
@@ -170,6 +193,30 @@ viene scritta per uno start ordinario senza trigger.
 
 La riga di accettazione dimostra il ritorno del downstream, non che il parser LG abbia decodificato
 correttamente. La conferma finale resta AVR + log device.
+
+### Diagnostica del callsite (revisione `dts-pcm-sink-diag`)
+
+La build aggiunge l'interpositore `gst_element_factory_create`, contatori atomici di ingresso
+(`hook_calls` = `make`, `create_calls` = `create`) letti da Rust tramite
+`pcmhd_factory_call_counts()`, e una riga `HOOK …` per ogni factory intercettato anche quando il
+modo è disarmato. Fail-closed, `PCMHD_CAPS`, validazione 192 kHz/8ch, timeout di 10 s e divieto di
+feed prima dell'handshake restano invariati.
+
+Come leggere il run successivo (ipotesi H1–H4 di
+`docs/agent-reports/pcmhd-sink-callsite-analysis-2026-11-28.md`):
+
+| Evidenza nel log eventi | Interpretazione |
+|---|---|
+| nessuna riga `HOOK`, `hook_calls=0 create_calls=0` | H1: libpf non raggiunge nessuno dei due wrapper (callsite diverso o risoluzione non interponibile). |
+| `HOOK … factory=audiosink armed=0` | H2: il factory è stato chiamato prima dell'arming; la generazione riportata dice quale sessione. |
+| righe `pcmhd-sink:` presenti ma file `/tmp/nativejelly-pcmhd-sink.log` assente | H3: il vecchio percorso hardcoded non era scrivibile; la diagnosi ora passa dal log eventi. |
+| `HOOK … armed=1`, `sink CAPS … rate=44100 …` oppure `REFUSED … something other than PCM S16LE 192 kHz 8 ch` | H4: il sink negozia una forma diversa da 192 kHz/8ch; **non** rilassare il controllo. |
+| `HOOK create factory=audiosink armed=1` seguito da `audiosink found` | libpf usa `factory_create`: il nuovo interpositore ha installato la stessa probe di `make`. |
+| `HOOK make` senza `HOOK create`, `create_calls=0` | la `create` interna alla `make` reale è stata soppressa dal guard: non è un callsite di libpf e non va contata come tale. |
+
+I contatori sono process-lifetime e non vengono azzerati dal disarmo: sono l'ultima prova che resta
+anche se tutti i file di log mancassero. Una riga `HOOK` per factory name e sessione evita lo spam
+senza nascondere una chiamata `audiosink` successiva a una chiamata `identity`.
 
 ---
 
@@ -220,3 +267,12 @@ necessario**: i valori dei gate in `engine.rs` sono ora variabili locali lette u
 chiamate inline), quindi il controllo sul sample rate segue `let sample_rate = ...;` +
 `sample_rate == 48_000` invece della vecchia espressione inline; sono state aggiunte due asserzioni
 testuali per il trigger force e per il log dei gate. Nessun gate è stato rilassato.
+
+### Aggiornamento alla revisione diagnostica `dts-pcm-sink-diag`
+
+Aggiunti l'interpositore `gst_element_factory_create`, le righe `HOOK make/create … armed=… session=…`
+scritte nel log eventi tramite `nj_pcmhd_hooks_log()` (con il vecchio file come copia secondaria) e i
+contatori atomici riportati nel messaggio di rifiuto. Aggiornati `Makefile`, `ci/check-elf.sh`,
+`ci/test_check_elf.py`, `ci/pcmhd-sink-test.c` e il verificatore statico. Nessuna modifica a caps,
+feed, timeout o gate. Questa lane non ha toolchain (`make`, `cargo`, `cc` assenti): non sono stati
+eseguiti compilazione C, harness C, build ARM, IPK, deploy o TV; restano da fare sui gate di CI.

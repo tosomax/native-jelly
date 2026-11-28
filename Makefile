@@ -900,16 +900,19 @@ SMP_INTERPOSER_LDFLAG = -Wl,--export-dynamic-symbol=$(SMP_CALLBACK_HOOK)
 # src/es_swap.c exports ioctl so libkadaptor's ES-renderer writes reach
 # rust-modules/src/player/es_carrier.rs (lossless audio to a receiver).
 SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=ioctl
-# src/pcmhd_sink.c exports gst_element_factory_make so libpf's `audiosink` creation reaches the
-# webOS 25 PCM-carrier caps hook. Both the object and export are omitted without devtriggers; with
-# the trigger off at runtime the wrapper resolves only the real factory and forwards it unchanged.
+# src/pcmhd_sink.c exports gst_element_factory_make and gst_element_factory_create so libpf's
+# `audiosink` creation reaches the webOS 25 PCM-carrier caps hook whichever factory it calls.
+# Both the object and exports are omitted without devtriggers; with the trigger off at runtime the
+# wrappers resolve only the real factory and forward it unchanged.
 # Do NOT spell this `$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=...)`: make splits
 # an `if`'s arguments on EVERY top-level comma, so the then-branch becomes just `-Wl` (the
 # `--export...` tail is read as the else-branch) and the linker driver rejects `-Wl` alone — CI ARM
 # run 46157912726. Use a real conditional so the flag's comma stays literal. The `filter` test
-# keeps the same "1 is among the words" semantics as PCMHD_SRC above.
+# keeps the same "1 is among the words" semantics as PCMHD_SRC above. libpf may create audiosink
+# through factory_create instead (see the 2026-11-28 callsite analysis), so both are exported.
 ifneq ($(filter 1,$(PCMHD_HOOK)),)
 SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make
+SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_create
 endif
 # --gc-sections: this link is gcc's, not rustc's. rustc passes --gc-sections itself when IT links an
 # executable (which is why pkg/nativejelly-storage above never needed the flag), but here the Rust

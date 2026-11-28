@@ -85,6 +85,47 @@ pub(crate) static PCMHD_TEST_LOCK: Mutex<()> = Mutex::new(());
 ))]
 extern "C" {
     fn nj_pcmhd_disarm();
+    fn nj_pcmhd_make_calls() -> u64;
+    fn nj_pcmhd_create_calls() -> u64;
+}
+
+/// C -> Rust diagnostic sink. `src/pcmhd_sink.c` writes here FIRST: the event log is the channel
+/// the television is already known to write, while its old hardcoded `/tmp` file may fail to open
+/// without a trace. Keeping the secondary file is harmless; losing the diagnosis was not.
+///
+/// # Safety
+/// `message` must be a valid NUL-terminated C string for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn nj_pcmhd_hooks_log(message: *const std::os::raw::c_char) {
+    if message.is_null() {
+        return;
+    }
+    let line = std::ffi::CStr::from_ptr(message).to_string_lossy();
+    crate::player::log(&format!("pcmhd-sink: {line}"));
+}
+
+/// Entries into the two intercepted factories in this process, for the diagnostic refusal line.
+/// Zero for both says libpf never reached either wrapper, whatever the log files contain. Default
+/// and host builds do not link the C hook, so they report zero rather than an unresolved symbol.
+pub(crate) fn pcmhd_factory_call_counts() -> (u64, u64) {
+    #[cfg(all(
+        feature = "devtriggers",
+        not(any(test, feature = "hostsim")),
+        target_arch = "arm",
+        target_os = "linux"
+    ))]
+    {
+        unsafe { (nj_pcmhd_make_calls(), nj_pcmhd_create_calls()) }
+    }
+    #[cfg(not(all(
+        feature = "devtriggers",
+        not(any(test, feature = "hostsim")),
+        target_arch = "arm",
+        target_os = "linux"
+    )))]
+    {
+        (0, 0)
+    }
 }
 
 /// C reads the arm flag through a Rust atomic rather than sharing a Rust static's C type.

@@ -77,12 +77,24 @@ static int ready_calls;
 static int refused_calls;
 static int make_calls;
 static int make_missing;
+static int make_calls_create; /* fake real make calls the create wrapper internally */
 static int probe_symbols_missing;
 static int add_probe_fail;
+static int add_probe_calls;
 static int send_result;
 static int send_calls;
 static int nested_return;
 static GstEvent *last_sent;
+/* Stub for the Rust export used by sink_log(); the device build writes the real event log. */
+static char hook_log_blob[8192];
+static int hook_log_calls;
+
+void nj_pcmhd_hooks_log(const char *message) {
+  hook_log_calls++;
+  size_t used = strlen(hook_log_blob);
+  snprintf(hook_log_blob + used, sizeof(hook_log_blob) - used, "%s\n",
+           message ? message : "(null)");
+}
 
 int nj_pcmhd_armed_load(void) { return armed; }
 void nj_pcmhd_armed_store(int value) { armed = value != 0; }
@@ -90,13 +102,35 @@ uint64_t nj_pcmhd_session_load(void) { return session; }
 void nj_pcmhd_sink_ready(uint64_t seen) { if (seen == session) ready_calls++; }
 void nj_pcmhd_sink_refused(uint64_t seen) { if (seen == session) { refused_calls++; armed = 0; } }
 
+struct GstElementFactory { const char *name; };
+static GstElementFactory audiosink_factory = { "audiosink" };
+static GstElementFactory identity_factory = { "identity" };
+static int fake_create_count;
+static int create_missing;
+
 static GstElement *fake_make(const char *factory, const char *name) {
-  (void)name;
   make_calls++;
+  /* Real GStreamer's make may be implemented through create; exercise that nested callsite. */
+  if (make_calls_create)
+    return gst_element_factory_create(&audiosink_factory, name);
   if (!factory || strcmp(factory, "audiosink"))
     return &replacement_element;
   return make_calls % 2 ? &element : &replacement_element;
 }
+
+static GstElement *fake_create(GstElementFactory *factory, const char *name) {
+  (void)name;
+  fake_create_count++;
+  if (!factory || strcmp(factory->name, "audiosink"))
+    return &replacement_element;
+  return fake_create_count % 2 ? &element : &replacement_element;
+}
+
+static const char *fake_object_get_name(GstElementFactory *factory) {
+  return factory ? factory->name : 0;
+}
+/* The fake name accessor returns static strings, so GLib's real allocator is not involved. */
+static void fake_g_free(void *ptr) { (void)ptr; }
 
 static GstPad *fake_get_static_pad(GstElement *sink, const char *name) {
   assert(name && !strcmp(name, "sink"));
@@ -109,6 +143,7 @@ static unsigned long fake_add_probe(GstPad *pad, unsigned int mask, int (*callba
   assert(mask == PCMHD_EVENT_PROBE_MASK);
   if (add_probe_fail)
     return 0;
+  add_probe_calls++;
   pad->probes++;
   pad->id = 1000 + pad->probes;
   pad->callback = callback;
@@ -220,10 +255,14 @@ void *__wrap_dlopen(const char *soname, int flags) {
 void *__wrap_dlsym(void *handle, const char *name) {
   (void)handle;
   if (!strcmp(name, "gst_element_factory_make")) return make_missing ? 0 : (void *)fake_make;
+  if (!strcmp(name, "gst_element_factory_create")) return create_missing ? 0 : (void *)fake_create;
+#define SYM(symbol, function) if (!strcmp(name, symbol)) return (void *)function
+  /* Not a probe symbol: the create wrapper needs the factory name even when probes are missing. */
+  SYM("gst_object_get_name", fake_object_get_name);
+  SYM("g_free", fake_g_free);
   /* GLib exposes G_TYPE_INSTANCE_GET_CLASS as a macro, not an exported function. */
   if (!strcmp(name, "g_type_instance_get_class")) return 0;
   if (probe_symbols_missing) return 0;
-#define SYM(symbol, function) if (!strcmp(name, symbol)) return (void *)function
   SYM("gst_element_get_static_pad", fake_get_static_pad);
   SYM("gst_pad_add_probe", fake_add_probe);
   SYM("gst_pad_remove_probe", fake_remove_probe);
@@ -281,7 +320,12 @@ static void reset(void) {
   armed = 0;
   session = 1;
   ready_calls = refused_calls = make_calls = 0;
-  make_missing = probe_symbols_missing = add_probe_fail = 0;
+  fake_create_count = 0;
+  make_calls_create = 0;
+  add_probe_calls = 0;
+  hook_log_calls = 0;
+  hook_log_blob[0] = 0;
+  make_missing = create_missing = probe_symbols_missing = add_probe_fail = 0;
   send_result = 1;
   send_calls = 0;
   nested_return = -1;
@@ -318,24 +362,101 @@ static void expect_caps(int expected, GstStructure *st, const char *what) {
 }
 
 static void test_disarmed_and_non_audio_need_only_real_make(void) {
+  uint64_t before = nj_pcmhd_make_calls();
   reset();
   probe_symbols_missing = 1;
   assert(gst_element_factory_make("identity", 0));
   assert(make_calls == 1 && s.make_ready && !s.probe_ready);
+  assert(strstr(hook_log_blob, "HOOK make factory=identity armed=0 session=1"));
+  assert(hook_log_calls == 1); /* one line per factory name per session */
+  assert(gst_element_factory_make("identity", 0));
+  assert(hook_log_calls == 1);
   assert(gst_element_factory_make("audiosink", 0));
-  assert(make_calls == 2 && !probe_pad && refused_calls == 0);
+  assert(make_calls == 3 && !probe_pad && refused_calls == 0);
+  assert(strstr(hook_log_blob, "HOOK make factory=audiosink armed=0 session=1"));
+  assert(nj_pcmhd_make_calls() == before + 3);
 
   reset();
   probe_symbols_missing = 1;
   armed = 1;
   assert(gst_element_factory_make("identity", 0));
   assert(make_calls == 1 && !s.probe_ready && refused_calls == 0);
+  assert(strstr(hook_log_blob, "HOOK make factory=identity armed=1 session=1"));
 
   reset();
   probe_symbols_missing = 1;
   armed = 1;
   assert(gst_element_factory_make("audiosink", 0));
   assert(make_calls == 1 && refused_calls == 1 && armed == 0 && !probe_pad);
+  assert(strstr(hook_log_blob, "HOOK make factory=audiosink armed=1 session=1"));
+}
+
+static void test_factory_create_forwards_diagnoses_and_installs(void) {
+  uint64_t make_before = nj_pcmhd_make_calls();
+  uint64_t create_before = nj_pcmhd_create_calls();
+
+  reset();
+  assert(gst_element_factory_create(&identity_factory, 0) == &replacement_element);
+  assert(fake_create_count == 1 && !probe_pad && refused_calls == 0);
+  assert(nj_pcmhd_create_calls() == create_before + 1);
+  assert(nj_pcmhd_make_calls() == make_before);
+  assert(strstr(hook_log_blob, "HOOK create factory=identity armed=0 session=1"));
+  assert(hook_log_calls == 1); /* repeated factory in one session is logged once */
+  gst_element_factory_create(&identity_factory, 0);
+  assert(fake_create_count == 2 && hook_log_calls == 1);
+
+  /* make and create are distinguishable even for the same factory name and session. */
+  gst_element_factory_make("identity", 0);
+  assert(strstr(hook_log_blob, "HOOK make factory=identity armed=0 session=1"));
+  assert(hook_log_calls == 2);
+
+  reset();
+  armed = 1;
+  assert(gst_element_factory_create(&audiosink_factory, 0));
+  assert(fake_create_count == 1 && probe_pad && probe_id && refused_calls == 0);
+  assert(strstr(hook_log_blob, "HOOK create factory=audiosink armed=1 session=1"));
+  nj_pcmhd_disarm();
+
+  reset();
+  probe_symbols_missing = 1;
+  armed = 1;
+  assert(gst_element_factory_create(&audiosink_factory, 0));
+  assert(refused_calls == 1 && armed == 0 && !probe_pad);
+
+  reset();
+  create_missing = 1;
+  armed = 1;
+  assert(gst_element_factory_create(&audiosink_factory, 0) == 0);
+  assert(fake_create_count == 0 && refused_calls == 0);
+  assert(strstr(hook_log_blob, "NOT ARMED: real gst_element_factory_create unavailable"));
+}
+
+static void test_nested_create_from_real_make_is_silent(void) {
+  uint64_t make_before = nj_pcmhd_make_calls();
+  uint64_t create_before = nj_pcmhd_create_calls();
+
+  /* Real make is implemented through create in this fixture. The nested create must be a plain
+   * forward: no create counter, no HOOK line, and only make's single probe installation. */
+  reset();
+  armed = 1;
+  make_calls_create = 1;
+  assert(gst_element_factory_make("audiosink", 0));
+  assert(make_calls == 1 && fake_create_count == 1);
+  assert(nj_pcmhd_make_calls() == make_before + 1);
+  assert(nj_pcmhd_create_calls() == create_before);
+  assert(strstr(hook_log_blob, "HOOK make factory=audiosink armed=1 session=1"));
+  assert(!strstr(hook_log_blob, "HOOK create"));
+  assert(add_probe_calls == 1 && probe_pad && probe_pad->probes == 1);
+  nj_pcmhd_disarm();
+
+  /* A direct create is still a real callsite: counted, logged and installed as before. */
+  reset();
+  armed = 1;
+  assert(gst_element_factory_create(&audiosink_factory, 0));
+  assert(nj_pcmhd_create_calls() == create_before + 1);
+  assert(strstr(hook_log_blob, "HOOK create factory=audiosink armed=1 session=1"));
+  assert(add_probe_calls == 1 && probe_pad && probe_pad->probes == 1);
+  nj_pcmhd_disarm();
 }
 
 static void test_pad_refs_install_replace_failure_and_disarm(void) {
@@ -424,6 +545,8 @@ static void test_missing_property_and_unexpected_caps_refuse_feed(void) {
 
 int main(void) {
   test_disarmed_and_non_audio_need_only_real_make();
+  test_factory_create_forwards_diagnoses_and_installs();
+  test_nested_create_from_real_make_is_silent();
   test_pad_refs_install_replace_failure_and_disarm();
   test_caps_false_absent_nonboolean_incomplete_and_complete();
   test_rejected_replacement_preserves_original_and_refuses_feed();

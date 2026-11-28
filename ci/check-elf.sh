@@ -79,25 +79,31 @@ ok "ioctl hook exported GLOBAL/DEFAULT"
 echo "== webOS 25 PCM-carrier sink hook =="
 # src/pcmhd_sink.c is compiled/exported only when the Rust devtriggers feature is present. A
 # release/no-default-features artifact must contain no such interposer at all; a diagnostic
-# artifact must export it exactly once. This checks the export, not the target callsite — the
-# runtime CAPS handshake in es_carrier/ff.rs fails closed if libpf never reaches the wrapper.
+# artifact must export BOTH interposers exactly once. This checks the exports, not the target
+# callsite — the runtime CAPS handshake in es_carrier/ff.rs fails closed if libpf never reaches
+# either wrapper.
 PCMHD_HOOK="${PCMHD_HOOK:-0}"
 case "$PCMHD_HOOK" in
   0|1) ;;
   *) fail "PCMHD_HOOK must be 0 or 1, got '$PCMHD_HOOK'" ;;
 esac
-PCMHD_ROWS=$(awk '$NF == "gst_element_factory_make" { print }' <<<"$DYN_SYMS")
-if [ "$PCMHD_HOOK" = 1 ]; then
-  [ "$(wc -l <<<"$PCMHD_ROWS" | tr -d ' ')" -eq 1 ] && [ -n "$PCMHD_ROWS" ] \
-    || fail "devtriggers build: gst_element_factory_make hook is not present exactly once in .dynsym"
-  awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { ok=1 } END { exit !ok }' <<<"$PCMHD_ROWS" \
-    || fail "gst_element_factory_make hook is not a defined GLOBAL/DEFAULT .dynsym function"
-  ok "devtriggers: gst_element_factory_make hook exported GLOBAL/DEFAULT"
-else
-  [ -z "$PCMHD_ROWS" ] \
-    || fail "non-devtriggers build must not define/import gst_element_factory_make"
-  ok "non-devtriggers: PCM-carrier interposer absent"
-fi
+check_pcmhd_export() {
+  local symbol="$1" rows
+  rows=$(awk -v symbol="$symbol" '$NF == symbol { print }' <<<"$DYN_SYMS")
+  if [ "$PCMHD_HOOK" = 1 ]; then
+    [ "$(wc -l <<<"$rows" | tr -d ' ')" -eq 1 ] && [ -n "$rows" ] \
+      || fail "devtriggers build: $symbol hook is not present exactly once in .dynsym"
+    awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { ok=1 } END { exit !ok }' <<<"$rows" \
+      || fail "$symbol hook is not a defined GLOBAL/DEFAULT .dynsym function"
+    ok "devtriggers: $symbol hook exported GLOBAL/DEFAULT"
+  else
+    [ -z "$rows" ] \
+      || fail "non-devtriggers build must not define/import $symbol"
+    ok "non-devtriggers: $symbol PCM-carrier interposer absent"
+  fi
+}
+check_pcmhd_export gst_element_factory_make
+check_pcmhd_export gst_element_factory_create
 
 echo "== crash-report identity =="
 # Two facts a Sentry crash report is built out of, and BOTH fail silently when wrong: a frame comes

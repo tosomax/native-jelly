@@ -12,6 +12,8 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 HOOK = "_ZN17StarfishMediaAPIs20callbackFunctionHookEixPKc"
 LOAD = "_ZN17StarfishMediaAPIs4LoadEPKcPFvixS1_PvES2_"
+PCMHD_MAKE = "gst_element_factory_make"
+PCMHD_CREATE = "gst_element_factory_create"
 FILLER = "synthetic-padding-line\n" * 100000  # More than 2 MiB, far beyond a pipe buffer.
 
 FAKE_TOOL = r'''#!/usr/bin/env python3
@@ -186,26 +188,47 @@ class ElfGateTests(unittest.TestCase):
                 self.assertIn("ioctl hook", result.stdout)
 
     def test_the_pcm_carrier_hook_is_feature_aware(self):
-        symbol = "3: 00000020 64 FUNC GLOBAL DEFAULT 1 gst_element_factory_make\n"
+        make = f"3: 00000020 64 FUNC GLOBAL DEFAULT 1 {PCMHD_MAKE}\n"
+        create = f"4: 00000030 64 FUNC GLOBAL DEFAULT 1 {PCMHD_CREATE}\n"
         spec = defaults()
-        spec["readelf:--dyn-syms"]["output"] += symbol
+        spec["readelf:--dyn-syms"]["output"] += make + create
         result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("devtriggers: gst_element_factory_make hook exported", result.stdout)
+        self.assertIn(f"devtriggers: {PCMHD_MAKE} hook exported", result.stdout)
+        self.assertIn(f"devtriggers: {PCMHD_CREATE} hook exported", result.stdout)
 
         result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "0"})
-        self.assertNotEqual(result.returncode, 0, "a release artifact must not carry the hook")
+        self.assertNotEqual(result.returncode, 0, "a release artifact must not carry the hooks")
         self.assertIn("non-devtriggers build must not define/import", result.stdout)
 
         spec = defaults()
         result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
-        self.assertNotEqual(result.returncode, 0, "a devtriggers artifact must export the hook")
+        self.assertNotEqual(result.returncode, 0, "a devtriggers artifact must export both hooks")
         self.assertIn("not present exactly once", result.stdout)
 
+        # One interposer alone is not enough: libpf may use either callsite.
+        for missing, present in [("make", create), ("create", make)]:
+            with self.subTest(missing=missing):
+                spec = defaults()
+                spec["readelf:--dyn-syms"]["output"] += present
+                result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
+                self.assertNotEqual(result.returncode, 0, "the other interposer was not required")
+                self.assertIn("not present exactly once", result.stdout)
+
         spec = defaults()
-        spec["readelf:--dyn-syms"]["output"] += "3: 00000020 64 FUNC GLOBAL DEFAULT UND gst_element_factory_make\n"
+        spec["readelf:--dyn-syms"]["output"] += (
+            f"3: 00000020 64 FUNC GLOBAL DEFAULT UND {PCMHD_MAKE}\n" + create
+        )
         result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
         self.assertNotEqual(result.returncode, 0, "an import is not an interposer")
+        self.assertIn("defined GLOBAL/DEFAULT", result.stdout)
+
+        spec = defaults()
+        spec["readelf:--dyn-syms"]["output"] += (
+            make + f"4: 00000030 64 FUNC GLOBAL DEFAULT UND {PCMHD_CREATE}\n"
+        )
+        result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
+        self.assertNotEqual(result.returncode, 0, "an imported create is not an interposer")
         self.assertIn("defined GLOBAL/DEFAULT", result.stdout)
 
     def test_early_forbidden_relocation_with_large_tail(self):
@@ -287,7 +310,9 @@ class PcmhdSourceContractTests(unittest.TestCase):
         harness = (ROOT / "ci/pcmhd-sink-test.c").read_text()
         resolved = set(re.findall(r'(?:SYM\([^,]+,\s*|dlsym\([^,]+,\s*)"([^"]+)"', hook))
         fakes = set(re.findall(r'SYM\("([^"]+)"', harness))
-        self.assertEqual(resolved - {"gst_element_factory_make"}, fakes)
+        # Both factory symbols are resolved only by the interposers; the harness supplies its own
+        # fake real functions for them, outside the SYM() probe-symbol table.
+        self.assertEqual(resolved - {PCMHD_MAKE, PCMHD_CREATE}, fakes)
         self.assertFalse(fakes - resolved)
         self.assertNotIn("g_type_instance_get_class", resolved)
         self.assertNotIn("g_type_instance_get_class", fakes)
@@ -295,6 +320,48 @@ class PcmhdSourceContractTests(unittest.TestCase):
         self.assertIn("replacement_event.type = FAKE_CAPS_EVENT_TYPE", harness)
         self.assertIn("GstEvent event = { FAKE_CAPS_EVENT_TYPE, &caps }", harness)
         self.assertIn("CAPS case '%s': got=%d expected=%d", harness)
+
+    def test_hook_diagnostics_reach_the_event_log_and_are_bounded(self):
+        hook = (ROOT / "src/pcmhd_sink.c").read_text()
+        carrier = (ROOT / "rust-modules/src/player/es_carrier.rs").read_text()
+        feed = (ROOT / "rust-modules/src/ff.rs").read_text()
+        self.assertIn("extern void nj_pcmhd_hooks_log(const char *message);", hook)
+        self.assertIn("nj_pcmhd_hooks_log(line);", hook)
+        self.assertIn('HOOK %s factory=%s armed=%d session=%llu', hook)
+        self.assertIn("PCMHD_HOOK_LOG_SLOTS", hook)
+        self.assertIn("log_factory_call_locked", hook)
+        self.assertIn('pub unsafe extern "C" fn nj_pcmhd_hooks_log', carrier)
+        self.assertIn("crate::player::log(&format!(\"pcmhd-sink: {line}\"));", carrier)
+        self.assertIn("pub(crate) fn pcmhd_factory_call_counts", carrier)
+        self.assertIn("hook_calls={hook_calls} create_calls={create_calls}", feed)
+
+    def test_factory_create_interposer_forwards_and_installs_the_same_probe(self):
+        hook = (ROOT / "src/pcmhd_sink.c").read_text()
+        makefile = (ROOT / "Makefile").read_text()
+        self.assertIn("GstElement *gst_element_factory_create(GstElementFactory *factory, const char *name)", hook)
+        self.assertIn('dlsym(gst, "gst_element_factory_create")', hook)
+        self.assertIn('dlsym(gst, "gst_object_get_name")', hook)
+        self.assertIn('dlsym(glib, "g_free")', hook)
+        self.assertGreaterEqual(hook.count("install_locked(element, session);"), 2)
+        self.assertIn("-Wl,--export-dynamic-symbol=gst_element_factory_create", makefile)
+        self.assertIn("uint64_t nj_pcmhd_make_calls(void)", hook)
+        self.assertIn("uint64_t nj_pcmhd_create_calls(void)", hook)
+        self.assertIn("_Atomic uint64_t make_calls_total", hook)
+        self.assertIn("_Atomic uint64_t create_calls_total", hook)
+
+    def test_nested_create_from_real_make_is_forwarded_silently(self):
+        hook = (ROOT / "src/pcmhd_sink.c").read_text()
+        harness = (ROOT / "ci/pcmhd-sink-test.c").read_text()
+        self.assertIn("static __thread int in_real_make;", hook)
+        self.assertIn("if (in_real_make) {", hook)
+        self.assertIn("int nested_ready = resolve_create_locked();", hook)
+        self.assertIn("return nested_ready ? create(factory, name) : 0;", hook)
+        self.assertIn("int previous = in_real_make;", hook)
+        self.assertIn("in_real_make = 1;", hook)
+        self.assertIn("in_real_make = previous;", hook)
+        self.assertIn("make_calls_create", harness)
+        self.assertIn("add_probe_calls", harness)
+        self.assertIn('assert(!strstr(hook_log_blob, "HOOK create"));', harness)
 
     def test_c_sources_do_not_redefine_makefile_compiler_macros(self):
         make_lines = [line for line in (ROOT / "Makefile").read_text().splitlines()
@@ -314,9 +381,9 @@ class PcmhdSourceContractTests(unittest.TestCase):
         self.assertIn("PCMHD_HOOK ?=", makefile)
         self.assertIn("src/pcmhd_sink.c,$(wildcard src/*.c)", makefile)
         self.assertNotIn("$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)", makefile)
-        self.assertIn("ifneq ($(filter 1,$(PCMHD_HOOK)),)\n"
-                      "SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make\n"
-                      "endif", makefile)
+        self.assertIn("ifneq ($(filter 1,$(PCMHD_HOOK)),)", makefile)
+        self.assertIn("SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make", makefile)
+        self.assertIn("SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_create", makefile)
         carrier = (ROOT / "rust-modules/src/player/es_carrier.rs").read_text()
         feed = (ROOT / "rust-modules/src/ff.rs").read_text()
         self.assertIn("timing.supported()", carrier)
@@ -335,12 +402,13 @@ class PcmhdLdflagExpansionTests(unittest.TestCase):
 
     make splits an `if`'s arguments on every *top-level* comma, so the then-branch
     was only `-Wl` and `--export-dynamic-symbol=...` was parsed as the else-branch;
-    the linker driver then rejected the bare `-Wl`. The flag now lives in a real
-    `ifneq` block, where its comma is literal. These tests parse that block out of
-    the Makefile and evaluate its two outcomes exactly.
+    the linker driver then rejected the bare `-Wl`. The flags now live in a real
+    `ifneq` block, where their commas are literal. These tests parse that block out
+    of the Makefile and evaluate its two outcomes exactly.
     """
 
-    FLAG = "-Wl,--export-dynamic-symbol=gst_element_factory_make"
+    FLAGS = ["-Wl,--export-dynamic-symbol=gst_element_factory_make",
+             "-Wl,--export-dynamic-symbol=gst_element_factory_create"]
 
     @staticmethod
     def _split_args(text):
@@ -367,34 +435,35 @@ class PcmhdLdflagExpansionTests(unittest.TestCase):
         return re.sub(r"\$\(filter\s+([^,)]+),([^)]*)\)",
                       lambda m: " ".join(w for w in m.group(2).split() if w == m.group(1)), text)
 
-    def _guard_and_flag(self):
+    def _guard_and_flags(self):
         makefile = (ROOT / "Makefile").read_text()
         match = re.search(
             r"^(?P<guard>if(?:eq|neq)\s+\(.*\))\n"
-            r"^SMP_INTERPOSER_LDFLAG\s*\+=\s*(?P<flag>[^\n]*gst_element_factory_make[^\n]*)\n"
+            r"(?P<flags>(?:^SMP_INTERPOSER_LDFLAG\s*\+=\s*[^\n]*\n)+)"
             r"^endif\b",
             makefile, re.M,
         )
-        self.assertIsNotNone(match, "gst_element_factory_make export must sit in an ifeq/ifneq block")
+        self.assertIsNotNone(match, "gst factory exports must sit in an ifeq/ifneq block")
         directive, args = match.group("guard").split(None, 1)
         lhs, rhs = self._split_args(args.strip()[1:-1])
-        return directive, lhs.strip(), rhs.strip(), match.group("flag").strip()
+        flags = [line.split("+=", 1)[1].strip() for line in match.group("flags").splitlines()]
+        return directive, lhs.strip(), rhs.strip(), flags
 
-    def _expanded_flag(self, pcmhd_hook):
-        directive, lhs, rhs, flag = self._guard_and_flag()
-        self.assertEqual(flag, self.FLAG, "the guarded line must append exactly one linker flag")
+    def _expanded_flags(self, pcmhd_hook):
+        directive, lhs, rhs, flags = self._guard_and_flags()
+        self.assertEqual(flags, self.FLAGS, "the guarded block must append exactly the two linker flags")
         variables = {"PCMHD_HOOK": pcmhd_hook}
         left, right = self._expand(lhs, variables), self._expand(rhs, variables)
         taken = (left == right) if directive == "ifeq" else (left != right)
-        return flag if taken else ""
+        return flags if taken else []
 
-    def test_hook_one_expands_to_the_exact_flag(self):
-        self.assertEqual(self._expanded_flag("1"), self.FLAG)
-        self.assertEqual(self._expanded_flag("1 "), self.FLAG)
+    def test_hook_one_expands_to_the_exact_flags(self):
+        self.assertEqual(self._expanded_flags("1"), self.FLAGS)
+        self.assertEqual(self._expanded_flags("1 "), self.FLAGS)
 
     def test_hook_zero_or_empty_expands_to_nothing(self):
-        self.assertEqual(self._expanded_flag("0"), "")
-        self.assertEqual(self._expanded_flag(""), "")
+        self.assertEqual(self._expanded_flags("0"), [])
+        self.assertEqual(self._expanded_flags(""), [])
 
     def test_old_if_form_split_at_the_comma(self):
         # Show the bug this fixes: make would read `then` = `-Wl`, and treat the

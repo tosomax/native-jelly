@@ -158,13 +158,48 @@ check('hook does not resolve non-exported GLib class macros',
       'g_type_instance_get_class' not in hook and 'g_object_class_find_property' not in hook)
 check('hook is inert without the armed flag', '!nj_pcmhd_armed_load()' in hook)
 
-check('Makefile exports the factory hook only with devtriggers',
+# Diagnostic build (2026-11-28 callsite analysis): both factory callsites, a log channel that
+# cannot disappear with a failed fopen(), and process-lifetime counters in the Rust refusal line.
+check('hook interposes both factory callsites',
+      'gst_element_factory_create' in hook
+      and 'dlsym(gst, "gst_element_factory_create")' in hook
+      and 'gst_object_get_name' in hook
+      and 'dlsym(glib, "g_free")' in hook
+      and hook.count('install_locked(element, session);') >= 2)
+check('hook logs every factory call armed or not, once per factory/session',
+      'HOOK %s factory=%s armed=%d session=%llu' in hook
+      and 'PCMHD_HOOK_LOG_SLOTS' in hook and 'log_factory_call_locked' in hook)
+check('nested create from the real make is forwarded without diagnostics',
+      'static __thread int in_real_make;' in hook
+      and 'if (in_real_make)' in hook
+      and 'int previous = in_real_make;' in hook)
+check('hook diagnostics use the Rust event-log export, not only /tmp',
+      'extern void nj_pcmhd_hooks_log(const char *message);' in hook
+      and 'nj_pcmhd_hooks_log(line);' in hook)
+check('Rust exports the event-log sink and counts factory entries',
+      'pub unsafe extern "C" fn nj_pcmhd_hooks_log' in carrier
+      and 'crate::player::log(&format!("pcmhd-sink: {line}"));' in carrier
+      and 'pub(crate) fn pcmhd_factory_call_counts' in carrier
+      and 'nj_pcmhd_make_calls()' in carrier and 'nj_pcmhd_create_calls()' in carrier)
+check('C publishes atomic make/create entry counters',
+      '_Atomic uint64_t make_calls_total' in hook
+      and '_Atomic uint64_t create_calls_total' in hook
+      and 'uint64_t nj_pcmhd_make_calls(void)' in hook
+      and 'uint64_t nj_pcmhd_create_calls(void)' in hook)
+check('refusal line reports hook_calls and create_calls',
+      'hook_calls={hook_calls} create_calls={create_calls}' in feed
+      and 'pcmhd_factory_call_counts()' in feed)
+
+check('Makefile exports both factory hooks only with devtriggers',
       'PCMHD_HOOK ?=' in makefile
       and '$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)' not in makefile
-      and 'ifneq ($(filter 1,$(PCMHD_HOOK)),)\n'
-          'SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make\n'
-          'endif' in makefile)
-check('check-elf is feature-aware', 'PCMHD_HOOK="${PCMHD_HOOK:-0}"' in elfcheck and 'non-devtriggers build must not define/import' in elfcheck)
+      and 'ifneq ($(filter 1,$(PCMHD_HOOK)),)' in makefile
+      and 'SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make' in makefile
+      and 'SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_create' in makefile)
+check('check-elf is feature-aware for both hooks',
+      'PCMHD_HOOK="${PCMHD_HOOK:-0}"' in elfcheck
+      and 'non-devtriggers build must not define/import' in elfcheck
+      and 'check_pcmhd_export gst_element_factory_create' in elfcheck)
 
 print()
 print('FAILURES:', len(fails))

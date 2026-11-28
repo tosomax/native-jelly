@@ -9563,7 +9563,11 @@ pub(crate) fn demux(
                         break;
                     }
                     if !crate::player::es_carrier::pcmhd_wait_ready() {
-                        crate::player::log("ff: PCM carrier refused — sink did not accept carrier CAPS; no carrier bytes fed");
+                        let (hook_calls, create_calls) =
+                            crate::player::es_carrier::pcmhd_factory_call_counts();
+                        crate::player::log(&format!(
+                            "ff: PCM carrier refused — sink did not accept carrier CAPS; hook_calls={hook_calls} create_calls={create_calls}; no carrier bytes fed"
+                        ));
                         crate::player::es_carrier::set_pcmhd(false);
                         SHARED.native_audio_header_refused.store(true, Ordering::Release);
                         SHARED.demux_failed.store(true, Ordering::Release);
