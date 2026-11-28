@@ -1,27 +1,27 @@
-name: v0.11.0 debug IPK
+name: PCM HD carrier diagnostic IPK
 
 on:
   workflow_dispatch:
   push:
-    branches: [v011-debug]
+    branches: [ci/dts-pcm-build]
 
 permissions:
   contents: read
 
 concurrency:
-  group: v011-debug-${{ github.ref }}
+  group: ci-dts-pcm-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   cross-build:
-    name: Build v0.11.0 debug IPK
+    name: Build PCM HD carrier debug IPK
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - name: Check out the experiment branch
+      - name: Check out the exact event commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: v011-debug
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Install nightly Rust
@@ -33,6 +33,9 @@ jobs:
       - name: Build ARM binary
         run: make WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' -j"$(nproc)"
 
+      - name: Verify PCMHD sink export
+        run: nm -D pkg/nativejelly | grep ' gst_element_factory_make$'
+
       - name: Package debug IPK
         run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
 
@@ -42,7 +45,7 @@ jobs:
       - name: Upload debug IPK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nativejelly-0.11.0-debug
+          name: nativejelly-0.11.0-pcmhd
           path: pkg/*.ipk
           if-no-files-found: error
           retention-days: 30
