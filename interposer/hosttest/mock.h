@@ -1,5 +1,5 @@
 // The libplayerAPIs contract, reproduced for a host test: the caller and the stock definition
-// live in separate translation units, so the call goes through the PLT exactly as it does in the
+// live in separate shared objects, so the call goes through a PLT slot exactly as it does in the
 // television's library.
 #pragma once
 #include <string>

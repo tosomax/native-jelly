@@ -114,6 +114,15 @@ class DtsWorkflow(unittest.TestCase):
         host_test = (ROOT / "interposer/hosttest/run.sh").read_text()
         self.assertNotIn("|| true", host_test)
         self.assertIn("set -eu", host_test)
+        # The mechanism gate must read ELF metadata, not architecture-specific disassembly text.
+        self.assertNotIn("@plt", host_test)
+        self.assertNotIn("objdump", host_test)
+        self.assertIn("readelf -W --dyn-syms", host_test)
+        self.assertIn("readelf -W --relocs", host_test)
+        self.assertIn('$7 == "UND"', host_test)
+        for relocation in ("R_X86_64_JUMP_SLOT", "R_AARCH64_JUMP_SLOT"):
+            self.assertIn(relocation, host_test)
+        self.assertIn("-lmockcaller -lmockstock", host_test)
 
 
 if __name__ == "__main__":

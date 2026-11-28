@@ -1,3 +1,4 @@
-libmock.so
+libmockcaller.so
+libmockstock.so
 libplatformfix.so
 test

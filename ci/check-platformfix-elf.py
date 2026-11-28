@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Gate the ARM libplatformfix.so artifact without compiling it.
 
-The host mechanism test proves preload/PLT behaviour on x86_64. This proves different facts about
-the shipped ARM object: ELF32/ARMv7 soft-float identity, the one exact unversioned GLOBAL/DEFAULT
-C++ definition, a deliberately small system-library dependency set, and no C++ runtime symbol
-version above the documented webOS 4.4.2 floor. It does not prove the TV's real symbol or playback.
+The host mechanism test proves preload/PLT behaviour on the host architecture. This proves
+different facts about the shipped ARM object: ELF32/ARMv7 soft-float identity, the one exact
+unversioned GLOBAL/DEFAULT C++ definition, a deliberately small system-library dependency set,
+and no C++ runtime symbol version above the documented webOS 4.4.2 floor. It does not prove the
+TV's real symbol or playback.
 """
 from __future__ import annotations
 

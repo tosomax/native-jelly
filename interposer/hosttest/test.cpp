@@ -1,4 +1,4 @@
-// Host test (x86_64) for the interposer mechanism, not for the television's ABI. Run with
+// Host test (host architecture) for the interposer mechanism, not for the television's ABI. Run with
 // `run.sh`, which builds the real interposer from ../platformfix.cpp and sets the same env the
 // app's one re-exec sets.
 #include <cstdio>

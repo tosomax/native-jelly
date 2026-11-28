@@ -102,7 +102,7 @@ cd rust-modules && CARGO_INCREMENTAL=0 cargo +nightly test --lib \
 # trigger/reexec gate: presence, explicit false, kill switch, boot latch, exact sentinel, maps
 cd rust-modules && CARGO_INCREMENTAL=0 cargo +nightly test --lib -p nj_base platformfix
 
-# interposer mechanism (x86_64, needs g++): stock, absent/empty/0/1 marker, kill switch, PLT + symbol
+# interposer mechanism (host arch, needs g++): stock, absent/empty/0/1 marker, kill switch, UND + JUMP_SLOT + symbol
 interposer/hosttest/run.sh
 ```
 
@@ -113,8 +113,10 @@ Full host suite: `make check` (queues on the machine-wide check lock).
 * `ci/test_platformfix.py`, `ci/test_arm_cc.py`, `ci/test_deploy_manifest.py` and
   `ci/test_source_bundle.py` statically pin the layer, deploy/source manifests, exact `NJ_ARM_CXX=1`
   selection, target refusal and workflow event-SHA checkout.
-* `interposer/hosttest/run.sh` is a required cross-build step. It compiles the x86_64 mechanism test
-  and fails on a missing PLT call or exact exported symbol; no `|| true` can turn either into a skip.
+* `interposer/hosttest/run.sh` is a required cross-build step. It compiles the host mechanism test
+  and fails on a missing interposable call site (the symbol called by `mock_query` must be UND in
+  the caller's `.dynsym` with a `R_X86_64_JUMP_SLOT` / `R_AARCH64_JUMP_SLOT` relocation) or a missing
+  exact exported symbol; no `|| true` can turn either into a skip.
 * `ci/check-platformfix-elf.py pkg/libplatformfix.so` gates the actual ARM artifact's ELF32/ARMv7
   soft-float identity, exact unversioned `GLOBAL/DEFAULT` definition, `DT_NEEDED`, the documented
   `GLIBCXX_3.4.21` ceiling and le requisiti CXXABI/GCC rilevati. Its canned-readelf regression test

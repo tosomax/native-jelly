@@ -1,31 +1,55 @@
 #!/bin/sh
-# Host test of the interposer MECHANISM (x86_64): the caller and the stock definition are in
-# separate TUs, so `mock_query` resolves `isPlatformSupportSoftwareAudioDecoder` through the PLT,
-# as libplayerAPIs does. It does NOT prove the ARM build or the TV's libstdc++ ABI.
+# Host test of the interposer MECHANISM (any host architecture): the caller and the stock definition
+# are in separate shared objects, so `mock_query` reaches `isPlatformSupportSoftwareAudioDecoder`
+# through an interposable JUMP_SLOT relocation, as libplayerAPIs does. It does NOT prove the ARM
+# build or the TV's libstdc++ ABI.
 set -eu
 cd "$(dirname "$0")"
 
 CXX=${CXX:-g++}
 ABI=-D_GLIBCXX_USE_CXX11_ABI=1
+SYMBOL='_ZN3smp4util37isPlatformSupportSoftwareAudioDecoderENSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE'
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/platformfix-hosttest.XXXXXX")
 trap 'rm -rf "$SCRATCH"' EXIT HUP INT TERM
 
-$CXX -O2 -g -Wall -Wextra -fPIC $ABI -shared -o "$SCRATCH/libmock.so" mock_stock.cpp mock_caller.cpp
+# Separate DSOs are deliberate: the caller's reference to the stock symbol must stay undefined so
+# that a preloaded definition can win. One DSO holding both would bind the call locally.
+$CXX -O2 -g -Wall -Wextra -fPIC $ABI -shared -o "$SCRATCH/libmockcaller.so" mock_caller.cpp
+$CXX -O2 -g -Wall -Wextra -fPIC $ABI -shared -o "$SCRATCH/libmockstock.so" mock_stock.cpp
 $CXX -O2 -g -Wall -Wextra -fPIC $ABI -shared -o "$SCRATCH/libplatformfix.so" ../platformfix.cpp -ldl
-$CXX -O2 -g -Wall -Wextra $ABI -o "$SCRATCH/test" test.cpp -L"$SCRATCH" -lmock -Wl,-rpath,'$ORIGIN'
+# Keep both DT_NEEDED entries even under the linker's default --as-needed: the stock DSO is needed
+# by the caller DSO, not directly by this executable.
+$CXX -O2 -g -Wall -Wextra $ABI -o "$SCRATCH/test" test.cpp -L"$SCRATCH" \
+  -Wl,--no-as-needed -lmockcaller -lmockstock -Wl,--as-needed -Wl,-rpath,'$ORIGIN'
 
-echo "== call site goes through the PLT (mechanism check)"
-objdump -d "$SCRATCH/libmock.so" > "$SCRATCH/libmock.dis"
-if ! PLT=$(awk '
-  /<_Z10mock_queryPKc>:/,/^$/ {
-    if ($0 ~ /PlatformSupportSoftwareAudioDecoder@plt/) { print; found=1 }
+echo
+echo "== call site is interposable (readelf mechanism check)"
+# AArch64 names it R_AARCH64_JUMP_SLOT, x86-64 R_X86_64_JUMP_SLOT; both mean a PLT slot the loader
+# can bind to a preloaded definition. Disassembly suffixes are not portable across host toolchains.
+# mock_caller.cpp defines only mock_query, so this is its call site.
+CALLER_DYNSYMS=$(readelf -W --dyn-syms "$SCRATCH/libmockcaller.so")
+ROWS=$(printf '%s\n' "$CALLER_DYNSYMS" | awk -v symbol="$SYMBOL" '$NF == symbol { print }')
+[ "$(printf '%s\n' "$ROWS" | wc -l | tr -d ' ')" -eq 1 ] || {
+  echo "FAIL: interposed symbol is not present exactly once in the caller's .dynsym" >&2
+  exit 1
+}
+printf '%s\n' "$ROWS" | awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 == "UND" { ok=1 } END { exit !ok }' || {
+  echo "FAIL: interposed symbol is not an undefined GLOBAL/DEFAULT FUNC in the caller's .dynsym" >&2
+  exit 1
+}
+printf '%s\n' "$ROWS"
+
+CALLER_RELOCS=$(readelf -W --relocs "$SCRATCH/libmockcaller.so")
+if ! JUMP=$(printf '%s\n' "$CALLER_RELOCS" | awk -v symbol="$SYMBOL" '
+  $3 == "R_X86_64_JUMP_SLOT" || $3 == "R_AARCH64_JUMP_SLOT" {
+    for (i = 4; i <= NF; i++) if ($i == symbol) { print; found=1 }
   }
   END { exit !found }
-' "$SCRATCH/libmock.dis"); then
-  echo "FAIL: mock_query has no interposable PLT call" >&2
+'); then
+  echo "FAIL: mock_query has no JUMP_SLOT relocation for the interposed symbol" >&2
   exit 1
 fi
-printf '%s\n' "$PLT"
+printf '%s\n' "$JUMP"
 
 echo
 echo "== stock: no preload (the bug: o24n refused)"
@@ -71,7 +95,6 @@ echo "== preload + marker + kill switch (must delegate stock)"
 echo
 echo "== exported symbol"
 DYNSYMS=$(readelf -W --dyn-syms "$SCRATCH/libplatformfix.so")
-SYMBOL='_ZN3smp4util37isPlatformSupportSoftwareAudioDecoderENSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE'
 ROWS=$(printf '%s\n' "$DYNSYMS" | awk -v symbol="$SYMBOL" '$NF == symbol { print }')
 [ "$(printf '%s\n' "$ROWS" | wc -l | tr -d ' ')" -eq 1 ] || {
   echo "FAIL: exact interposer symbol is not present once in .dynsym" >&2

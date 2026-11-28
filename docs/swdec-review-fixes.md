@@ -39,8 +39,9 @@ realmente prodotto o del comportamento TV.
 - Python: layer/target/workflow/contratti runtime statici, ordine delle definizioni prima di `all`
   e dipendenza DSO nel manifest debug, selettore driver ARM, gate artefatto con output `readelf`
   fittizio e controlli negativi, deploy atomico, allowlist e omissione source bundle.
-- Host C++ runner: marker assente/vuoto/`0`/`1`, kill switch, PLT obbligatorio e simbolo esatto
-  definito `GLOBAL/DEFAULT`; output in directory temporanea.
+- Host C++ runner: marker assente/vuoto/`0`/`1`, kill switch, simbolo chiamato da `mock_query` UND
+  in `.dynsym` con relocation `JUMP_SLOT` (X86_64/AArch64) e simbolo esatto definito `GLOBAL/DEFAULT`;
+  output in directory temporanea.
 
 ## Verifiche eseguite
 

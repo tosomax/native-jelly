@@ -345,8 +345,9 @@ jobs:
         run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
 
       - name: Interposer host mechanism gate
-        # Compiles the x86_64 mock caller/stock library and the real interposer. It exercises the
-        # PLT preload path and every sentinel/kill-switch case; failure is a failed job, never a skip.
+        # Compiles the host mock caller/stock libraries and the real interposer. It checks the
+        # interposable call site with readelf and exercises every sentinel/kill-switch case;
+        # failure is a failed job, never a skip.
         run: interposer/hosttest/run.sh
 
       - name: Interposer DSO identity, symbol and version gate

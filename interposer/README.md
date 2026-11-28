@@ -22,7 +22,7 @@ make FLAVOR=debug platformfix     # -> pkg/libplatformfix.so; stable/nightly/REL
 The Makefile sets `NJ_ARM_CXX=1` for this one C++ link. The wrapper accepts only that exact value;
 `0`, `false`, an empty string or unset all keep the ordinary C driver.
 
-Host mechanism test (x86_64, needs `g++`; it does not prove the ARM build):
+Host mechanism test (host architecture, needs `g++`; it does not prove the ARM build):
 
 ```sh
 interposer/hosttest/run.sh

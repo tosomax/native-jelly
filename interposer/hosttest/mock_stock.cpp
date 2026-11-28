@@ -1,5 +1,5 @@
-// A stand-in for libplayerAPIs' stock whitelist. It is a separate TU from the caller, so the
-// caller has no body to inline and the call is resolved through the PLT.
+// A stand-in for libplayerAPIs' stock whitelist. It lives in its own DSO, so the caller has no
+// body to bind locally and the call is resolved through the PLT.
 #include "mock.h"
 
 #include <cstdio>
