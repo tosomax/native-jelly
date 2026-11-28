@@ -89,8 +89,14 @@ pub(crate) fn carrier_firmware() -> bool {
     firmware_measured(nj_platform::tv::device::info().major)
 }
 
+/// EXPERIMENT (`v011-carrier25`): let the carrier arm on firmware it was not measured on. The ES
+/// renderer write is still guarded by the request code, word 8 and the exact burst size, and
+/// [`silent_route`] now also gives up when LG writes a size this firmware does not use, so a set
+/// that does not match falls back instead of playing silence.
+const ANY_FIRMWARE: bool = true;
+
 fn firmware_measured(major: u32) -> bool {
-    major == MEASURED_MAJOR
+    ANY_FIRMWARE || major == MEASURED_MAJOR
 }
 
 /// Is the carrier on for the playback being started?
@@ -116,8 +122,24 @@ pub(crate) fn silent_route(frames: i32) -> bool {
     if !ON.load(Ordering::Acquire) || frames < SILENT_ROUTE_FRAMES {
         return false;
     }
-    let writes = SWAPPED.load(Ordering::Relaxed) + MISSED.load(Ordering::Relaxed) + RETRIED.load(Ordering::Relaxed);
-    if writes > 0 || UNAVAILABLE.swap(true, Ordering::AcqRel) {
+    let swapped = SWAPPED.load(Ordering::Relaxed);
+    let writes = swapped + MISSED.load(Ordering::Relaxed) + RETRIED.load(Ordering::Relaxed);
+    if writes > 0 {
+        return false;
+    }
+    // EXPERIMENT: LG's renderer made writes, but none carried the size the DD+ burst has on the
+    // firmware the hook was measured on (kernels other than webOS 6). Nothing is being replaced, so
+    // the receiver would hear our silent E-AC-3: give the carrier up like the no-writes case.
+    let other = OTHER.load(Ordering::Relaxed);
+    if other > 0 {
+        if UNAVAILABLE.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        set_on(false);
+        crate::player::log(&format!("es_carrier: {other} LG ES writes with an unexpected size; reloading without the carrier"));
+        return true;
+    }
+    if UNAVAILABLE.swap(true, Ordering::AcqRel) {
         return false;
     }
     set_on(false);
