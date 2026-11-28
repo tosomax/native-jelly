@@ -9488,13 +9488,21 @@ pub(crate) fn demux(
                 // DTS-HD frames for player::es_carrier's ES-renderer swap.
                 let es_carrier = dts_iec && crate::player::es_carrier::on();
                 let mut carrier = crate::player::es_carrier::Packer::default();
+                // webOS 25 (dev trigger only): there is no renderer write to swap, so the SAME
+                // bursts are fed as raw PCM into the 192 kHz/8-channel Load the engine declared.
+                let pcmhd = dts_audio && crate::player::es_carrier::pcmhd();
+                let mut pcmhd_packer = crate::player::es_carrier::Pcmhd::default();
+                let mut pcmhd_chunks = 0u32;
                 if es_carrier {
                     crate::player::log("ff: DTS-HD frames as IEC 61937 type IV bursts, 3 per silent E-AC-3 carrier frame");
                 }
-                if dts_audio {
+                if pcmhd {
+                    crate::player::log("ff: PCM carrier: DTS-HD frames as three 32768-byte IEC 61937 bursts, fed as one 98304-byte PCM buffer every 32 ms");
+                }
+                if dts_audio && !pcmhd {
                     crate::player::log("ff: DTS core extraction on (DTS-HD extensions discarded)");
                 }
-                if dts_iec {
+                if dts_iec && !pcmhd {
                     crate::player::log("ff: DTS core as IEC 61937 bursts in S16LE stereo PCM");
                 }
                 if let Some((fi, ch)) = aac_adts {
@@ -9786,6 +9794,8 @@ pub(crate) fn demux(
                         }
                         carrier.reset();
                         mat.reset();
+                        pcmhd_packer.reset();
+                        pcmhd_chunks = 0;
                         crate::player::es_carrier::clear();
                     }
                     let r = av_read_frame(fmt, pkt);
@@ -9938,6 +9948,9 @@ pub(crate) fn demux(
                         // 14-bit packed one.
                         let mut carrier_au: Option<(i64, &[u8])> = None;
                         let mut mat_aus: Vec<(i64, &[u8])> = Vec::new();
+                        // The webOS 25 carrier's own buffer must outlive the push below: the AU
+                        // queue copies it, but the borrow lives until `aus` is consumed.
+                        let mut pcmhd_au: Option<(i64, Vec<u8>)> = None;
                         if thd_carrier {
                             match mat.au(raw, pts) {
                                 Ok(ts) => mat_aus = ts.into_iter().map(|t| (t, crate::player::es_carrier::SILENT_EAC3)).collect(),
@@ -9963,8 +9976,37 @@ pub(crate) fn demux(
                                 }
                             }
                         }
+                        if pcmhd {
+                            // The core length is only a fallback for a frame too wide for its
+                            // 32768-byte burst, exactly as on the C1 path.
+                            let core_len = dts_core_packet(raw).map_or(0, |c| c.len());
+                            match pcmhd_packer.frame(raw, core_len, pts) {
+                                Ok(Some(au)) => {
+                                    pcmhd_au = Some(au);
+                                    pcmhd_chunks += 1;
+                                    if pcmhd_chunks == 1 || pcmhd_chunks % 250 == 0 {
+                                        let (frames, extensions) = pcmhd_packer.summary();
+                                        crate::player::log(&format!(
+                                            "ff: PCM carrier {pcmhd_chunks} chunks of {} B ({} DTS frames, {} with an extension substream, queued {} chunks)",
+                                            crate::player::es_carrier::PCMHD_CHUNK,
+                                            frames,
+                                            extensions,
+                                            crate::aq::aq_bytes(aqa_p)
+                                        ));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(()) => {
+                                    crate::player::log("ff: PCM carrier: DTS-HD frame fits no type IV burst; refusing audio feed");
+                                    SHARED.demux_failed.store(true, Ordering::Release);
+                                    SHARED.demux_io_failed.store(true, Ordering::Release);
+                                    av_packet_unref(pkt);
+                                    break;
+                                }
+                            }
+                        }
                         let dts_core: Option<std::borrow::Cow<'_, [u8]>> =
-                            if converter.is_none() && framed.is_none() && dts_audio && !es_carrier {
+                            if converter.is_none() && framed.is_none() && dts_audio && !es_carrier && !pcmhd {
                                 let Some(core) = dts_core_packet(raw) else {
                                     crate::player::log("ff: DTS packet has no complete supported core; refusing audio feed");
                                     SHARED.demux_failed.store(true, Ordering::Release);
@@ -10025,6 +10067,7 @@ pub(crate) fn demux(
                             Some(raw) // AUDIO lane, verbatim
                         };
                         let aus: Vec<(i64, &[u8])> = match single {
+                            _ if pcmhd => pcmhd_au.iter().map(|(t, b)| (*t, b.as_slice())).collect(),
                             _ if es_carrier => carrier_au.into_iter().collect(),
                             _ if thd_carrier => mat_aus,
                             Some(au) => vec![(pts, au)],

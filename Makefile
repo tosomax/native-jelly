@@ -895,6 +895,10 @@ SMP_INTERPOSER_LDFLAG = -Wl,--export-dynamic-symbol=$(SMP_CALLBACK_HOOK)
 # src/es_swap.c exports ioctl so libkadaptor's ES-renderer writes reach
 # rust-modules/src/player/es_carrier.rs (lossless audio to a receiver).
 SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=ioctl
+# src/pcmhd_sink.c exports gst_element_factory_make so libpf's `audiosink` creation reaches the
+# webOS 25 PCM-carrier caps hook in the same module. Dev trigger only: with no trigger armed the
+# wrapper is a plain forward and never resolves a GStreamer symbol.
+SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make
 # --gc-sections: this link is gcc's, not rustc's. rustc passes --gc-sections itself when IT links an
 # executable (which is why pkg/nativejelly-storage above never needed the flag), but here the Rust
 # code arrives as a finished staticlib, so without the flag every section of every archive member

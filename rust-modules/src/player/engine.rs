@@ -1153,6 +1153,8 @@ fn receiver_ready(caps: &nj_platform::devcaps::Caps, what: &str) -> bool {
 /// the IEC 61937 carrier of a DTS core. Declared as `DTS`, the C1 (webOS 6) refuses the Load with
 /// `601 Resource Allocation Error`. `sampleRate` is in kilohertz, the unit libpf matches it in.
 /// Spliced at the `provider` anchor like [`with_opus_info`]; any other declaration is unchanged.
+/// This is the SHIPPING shape: the dev-only 8-channel 192 kHz PCM carrier is
+/// [`with_pcmhd_info`], applied on top of this node and never reachable without its trigger.
 fn with_iec_pcm_info(p: &str, audio: &str) -> String {
     if audio != "PCM" {
         return p.to_string();
@@ -1162,6 +1164,25 @@ fn with_iec_pcm_info(p: &str, audio: &str) -> String {
         r#""provider":"nativejelly","pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#,
         1,
     )
+}
+
+/// The webOS 25 **PCM carrier** declaration: the same `audio: PCM` Load, but 192 kHz / 8 channels
+/// S16LE, which is what the carrier's 98304-byte chunks are (`es_carrier::PCMHD_CHUNK`). `libpf`'s
+/// `setPCMinfo` reads `channelMode` as a name OR as `N-channel` via `sscanf("%2d-channel")`,
+/// verified statically (LUT @ 0x18218c, format @ 0x14bb58, repo report §4.3), and the resource
+/// calculator maps `audio/x-raw` to the absent `"pcm"` key, so the audio list is empty — no ADEC.
+///
+/// Applied AFTER [`with_iec_pcm_info`] has put the 48 kHz stereo node in, and only while the dev
+/// trigger is on: the two shapes differ in exactly these four fields, and a replacement that
+/// silently missed would leave a stereo-sized declaration over a 6x wider feed.
+fn with_pcmhd_info(p: &str) -> String {
+    let replaced = p.replacen(
+        r#""pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#,
+        r#""pcmInfo":{"format":"S16LE","channelMode":"8-channel","layout":"interleaved","sampleRate":192,"bitsPerSample":16}"#,
+        1,
+    );
+    debug_assert_ne!(replaced, p, "PCM carrier payload carries no stereo pcmInfo to widen");
+    replaced
 }
 
 /// The `contents.immersive` node — **the Dolby Atmos half of the same envelope**, and the reason
@@ -1719,12 +1740,35 @@ fn start_bufferfeed_inner(
                 log(&format!("start_bufferfeed: {codec} audio is converted to AC3 on the television"));
             }
             dts_iec = ac == "DTS" && receiver_ready(&caps, "DTS");
+            // webOS 25: the C1's ioctl route does not exist (no `0x40285207` in its libraries),
+            // so the same bursts go out as raw PCM that `audiosink` takes for a bitstream. Dev
+            // trigger only, webOS 25 only, and the transform of the Load below is PCM 192k/8ch.
+            // `docs/agent-reports/es-carrier-webos25.md` §4.3-5 is the evidence.
+            let pcmhd = dts_iec
+                && crate::player::es_carrier::pcmhd_firmware()
+                && crate::player::es_carrier::pcmhd_requested();
+            crate::player::es_carrier::set_pcmhd(pcmhd);
+            #[cfg(feature = "devtriggers")]
+            {
+                if dts_iec && crate::player::es_carrier::pcmhd_requested() && !pcmhd {
+                    log(&format!(
+                        "start_bufferfeed: PCM carrier NOT armed — webOS {} is not the measured 25",
+                        nj_platform::tv::device::info().major
+                    ));
+                }
+            }
             // Lossless audio: DTS-HD over the DD+ carrier (es_carrier) replaces the PCM core carrier;
             // `pump` falls back to the core if LG's DD+ route turns out not to be in pass-through.
             let carrier = dts_iec && crate::player::es_carrier::available();
             let hbr = if truehd { true } else { crate::player::es_carrier::set_on(carrier) };
             if carrier {
                 log(&format!("start_bufferfeed: DTS-HD over the DD+ pass-through carrier ({})", if hbr { "HBR" } else { "192 kHz" }));
+            }
+            #[cfg(feature = "devtriggers")]
+            {
+                if pcmhd {
+                    log("start_bufferfeed: PCM carrier armed by /tmp/nativejelly-pcmhd: Load declares PCM S16LE 192 kHz 8 ch; demuxer feeds 98304-byte IEC 61937 chunks every 32 ms");
+                }
             }
             let ac = if carrier || truehd { "AC3 PLUS" } else if dts_iec { "PCM" } else { ac };
             SHARED.dg_load_a.store(diagnostic, Ordering::Relaxed);
@@ -1758,6 +1802,11 @@ fn start_bufferfeed_inner(
                     return Err(crate::route::RouteStartResult::StartFailed);
                 };
                 payload
+            } else if pcmhd {
+                // The webOS 25 PCM carrier is the one declaration `build_av_payload` cannot
+                // express: `audio: PCM` plus the 192 kHz / 8-channel pcmInfo libpf parses with
+                // `sscanf("%2d-channel")` (`docs/agent-reports/es-carrier-webos25.md` §4.3).
+                with_pcmhd_info(&av)
             } else {
                 av
             };
@@ -1852,7 +1901,13 @@ fn start_bufferfeed_inner(
         // Two-lane feed: the demuxer routes es=1 video to aq_video and es=2 audio to
         // aq_audio, each with its own cap + feeder.
         let mut qv = crate::aq::aq_new(AQ_VIDEO_BYTES);
-        let mut qa = crate::aq::aq_new(AQ_AUDIO_BYTES);
+        // The webOS 25 PCM carrier is 3 MB/s (192 kHz x 8 ch x 2 B) against the C1 carrier's
+        // 768 kB/s, so the byte-sized 1 MiB audio cap would be a THIRD of a second of read-ahead
+        // instead of 1.3 s. This dev mode only (a direct play, never an ABR rung) keeps the same
+        // number of seconds. `abr/sim.rs` still models the shipping 1 MiB, which is why this is a
+        // queue size here and not a change to `AQ_AUDIO_BYTES`.
+        let audio_bytes = if crate::player::es_carrier::pcmhd() { AQ_AUDIO_BYTES * 4 } else { AQ_AUDIO_BYTES };
+        let mut qa = crate::aq::aq_new(audio_bytes);
         let aqv_raw = &mut *qv as *mut AuQueue;
         let aqa_raw = &mut *qa as *mut AuQueue;
         let hs_raw = &mut *hs as *mut HttpStream;
@@ -2310,6 +2365,9 @@ fn teardown(ps: &mut crate::route::PlaybackSession, pa: &mut super::adapter::Pla
     // Lossless audio: release the earc_route lease and stop swapping as soon as playback ends, so the
     // HBR hooks never outlive the title (a reload re-arms them in start_bufferfeed).
     crate::player::es_carrier::set_on(false);
+    // ...and disarm the webOS 25 PCM carrier's caps hook with it, so a reload re-decides instead of
+    // inheriting the previous title's declaration.
+    crate::player::es_carrier::set_pcmhd(false);
     // A start still queued behind the previous object's `Unload` is the playback this stop ends.
     // Always sent: the machine owns whether anything is queued (a no-op otherwise), and no copy of
     // that fact in the session can go stale across a landing that replaced the session.
@@ -6057,6 +6115,24 @@ mod sink_envelope_tests {
         }
         let off = nj_platform::devcaps::Caps::assumed();
         assert!(!receiver_ready(&off, "DTS"), "never without the setting in the attempt's caps");
+    }
+
+    /// The webOS 25 PCM carrier's Load: `audio: PCM` widened to the shape its 98304-byte chunks
+    /// are. A miss here is silent (the decoder plays raw PCM), so the fields are asserted one by
+    /// one and the stereo node must be gone.
+    #[test]
+    fn pcmhd_declares_eight_channels_at_192k_and_no_stereo_node() {
+        let ps = crate::route::PlaybackSession::IDLE;
+        let stereo = build_av_payload(&ps, "H264", "PCM", ENVELOPE_FHD60);
+        let wide = with_pcmhd_info(&stereo);
+        let v: serde_json::Value = serde_json::from_str(&wide).unwrap();
+        let contents = &v["args"][0]["option"]["externalStreamingInfo"]["contents"];
+        assert_eq!(contents["codec"]["audio"], "PCM");
+        assert_eq!(contents["pcmInfo"], serde_json::json!({
+            "format": "S16LE", "channelMode": "8-channel", "layout": "interleaved",
+            "sampleRate": 192, "bitsPerSample": 16
+        }));
+        assert!(!wide.contains(r#""channelMode":"stereo""#), "the stereo node must not survive");
     }
 
     #[test]

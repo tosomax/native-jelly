@@ -76,6 +76,17 @@ awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" { ok=1 } END { exit !ok }
   || fail "ioctl hook is not a GLOBAL/DEFAULT .dynsym function"
 ok "ioctl hook exported GLOBAL/DEFAULT"
 
+echo "== webOS 25 PCM-carrier sink hook =="
+# src/pcmhd_sink.c defines gst_element_factory_make so libpf's audiosink creation reaches the
+# caps hook (dev trigger only). Same loader rule as the two above: without the export the library's
+# PLT slot keeps its own definition and the hook is dead code that logs nothing.
+PCMHD_ROWS=$(awk '$NF == "gst_element_factory_make" && $7 != "UND" { print }' <<<"$DYN_SYMS")
+[ "$(wc -l <<<"$PCMHD_ROWS" | tr -d ' ')" -eq 1 ] && [ -n "$PCMHD_ROWS" ] \
+  || fail "gst_element_factory_make hook is not defined exactly once in .dynsym"
+awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" { ok=1 } END { exit !ok }' <<<"$PCMHD_ROWS" \
+  || fail "gst_element_factory_make hook is not a GLOBAL/DEFAULT .dynsym function"
+ok "gst_element_factory_make hook exported GLOBAL/DEFAULT"
+
 echo "== crash-report identity =="
 # Two facts a Sentry crash report is built out of, and BOTH fail silently when wrong: a frame comes
 # back `symbolicatorStatus: "missing_symbol"` with no error attached, which is indistinguishable

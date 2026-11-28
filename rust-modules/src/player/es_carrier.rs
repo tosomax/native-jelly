@@ -15,6 +15,17 @@
 //! receiver gets the bitstream while LG keeps timing, A/V sync, pause and seek exactly as for a DD+
 //! title. With the HBR lease ([`set_on`]) LG runs the link at 8 channels x 192 kHz and every chunk is
 //! four times larger. Tested on an LG C1 (webOS 6) with a Sony STR-DN1080.
+//!
+//! **webOS 25 has no such renderer write.** Its audio path is the GStreamer `audiosink`
+//! (`libgstlgaudiosink.so`), which takes `audio/x-raw` caps and calls `lgao_feed` with
+//! `LGAO_DATA_PCM` unless the caps carry their extra bitstream fields; `ioctl(0x40285207)` exists in
+//! none of that firmware's libraries (`docs/agent-reports/es-carrier-webos25.md`). The diagnostic
+//! answer here is a **PCM carrier**, dev-trigger only (`/tmp/nativejelly-pcmhd`, webOS 25 only):
+//! the Load declares `PCM` S16LE 192 kHz 8 ch, the demuxer FEEDS the same three-burst 98304-byte
+//! chunks every 32 ms as raw PCM, and `src/pcmhd_sink.c` rewrites the caps event on the `audiosink`
+//! so the sink treats those bytes as an IEC 61937 bitstream. Nothing here is enabled by default and
+//! nothing claims the end-to-end path is proven: `docs/agent-reports/pcmhd-carrier.md` records the
+//! exact ABI evidence and the unproven steps.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -22,6 +33,9 @@ use std::sync::Mutex;
 
 /// LG's DD+ burst on the 192 kHz stereo carrier: 1536 samples x 4 (rate) x 4 bytes.
 pub(crate) const CHUNK: usize = 24576;
+/// The webOS 25 PCM carrier's chunk: 192000 Hz x 8 ch x 2 B x 32 ms = 98304 B, exactly the HBR
+/// chunk the C1 path queues ([`Stream::SIZE`]) and what dts_restore_plus's PCM carrier feeds.
+pub(crate) const PCMHD_CHUNK: usize = 98304;
 /// One DTS-HD frame's burst at the same carrier: 512 samples x 4 x 4 bytes (IEC 61937 type IV,
 /// repetition period 2048, subtype 2).
 const BURST: usize = 8192;
@@ -41,6 +55,14 @@ static ON: AtomicBool = AtomicBool::new(false);
 #[no_mangle]
 #[allow(non_upper_case_globals)]
 pub static nj_es_armed: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// The webOS 25 PCM carrier (dev trigger, `src/pcmhd_sink.c`): true for the playback whose Load
+/// declares PCM 192 kHz 8 ch and whose demuxer feeds the carrier chunks as raw PCM.
+static PCMHD: AtomicBool = AtomicBool::new(false);
+/// What `src/pcmhd_sink.c` reads before it looks at a caps event: non-zero only while [`PCMHD`],
+/// so with the mode off the exported `gst_element_factory_make` is a plain forward.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static nj_pcmhd_armed: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 /// Bursts and writes are HBR-sized (x [`HBR`]).
 static WIDE: AtomicBool = AtomicBool::new(false);
 /// `/dev/earc_route`, open while HBR is on: writing "2" leases eARC to renderer index 1 (LG's main
@@ -91,6 +113,42 @@ pub(crate) fn carrier_firmware() -> bool {
 
 fn firmware_measured(major: u32) -> bool {
     major == MEASURED_MAJOR
+}
+
+/// The webOS major the PCM carrier's caps hook was written against: webOS 25, whose ES path is the
+/// GStreamer `audiosink` and not the C1's renderer ioctl. Anywhere else the hook is never armed
+/// (`docs/agent-reports/es-carrier-webos25.md` §2, §4.3).
+const PCMHD_MEASURED_MAJOR: u32 = 25;
+
+/// Is this the firmware the PCM carrier was written for?
+pub(crate) fn pcmhd_firmware() -> bool {
+    pcmhd_measured(nj_platform::tv::device::info().major)
+}
+
+fn pcmhd_measured(major: u32) -> bool {
+    major == PCMHD_MEASURED_MAJOR
+}
+
+/// Has the dev trigger asked for the PCM carrier? The trigger only opens the door: the caller also
+/// requires webOS 25 and a receiver, and nothing here is a shipping default.
+pub(crate) fn pcmhd_requested() -> bool {
+    nj_base::devtrig::flag("pcmhd")
+}
+
+/// Is the webOS 25 PCM carrier on for the playback being started?
+pub(crate) fn pcmhd() -> bool {
+    PCMHD.load(Ordering::Acquire)
+}
+
+/// Arm or disarm the PCM carrier. Both the Rust demuxer ([`pcmhd`]) and `src/pcmhd_sink.c`
+/// ([`nj_pcmhd_armed`]) read it, and it is set BEFORE the Load that creates the `audiosink`, on the
+/// main thread. Independent of [`ON`]: this mode never touches the C1 ES-renderer path.
+pub(crate) fn set_pcmhd(on: bool) {
+    PCMHD.store(on, Ordering::Release);
+    nj_pcmhd_armed.store(i32::from(on), Ordering::Release);
+    if on {
+        crate::player::log("es_carrier: PCM carrier armed (PCM S16LE 192 kHz 8 ch, IEC 61937 chunks as raw PCM)");
+    }
 }
 
 /// Is the carrier on for the playback being started?
@@ -387,6 +445,68 @@ impl Packer {
     pub(crate) fn reset(&mut self) {
         self.acc.clear();
         self.next_pts = None;
+    }
+}
+
+/// The webOS 25 PCM carrier's packer: the same three-burst chunk [`Packer`] queues for the C1's ES
+/// swap, but returned DENSE for the demuxer to Feed, because there the sink's PCM input *is* the
+/// IEC 61937 stream (`docs/agent-reports/es-carrier-webos25.md` §4.3, §5.2).
+///
+/// It deliberately does NOT touch [`QUEUE`] or [`nj_es_armed`]: on webOS 25 there is no renderer
+/// write to intercept, and leaving the C1 path's state alone is what keeps a trigger left in
+/// `/tmp` from arming two mechanisms at once.
+#[derive(Default)]
+pub(crate) struct Pcmhd {
+    acc: Vec<Vec<u8>>,
+    first_pts: i64,
+    /// See [`Packer::next_pts`]: the carrier timestamps must be contiguous for the receiver, which
+    /// schedules on them and re-locks a burst stream only while the 32 ms lattice holds.
+    next_pts: Option<i64>,
+    frames: u32,
+    /// Frames whose packet carried bytes beyond the DTS core, i.e. a DTS-HD/X extension substream.
+    /// Diagnostic only: the trigger does not gate on it (a core-only DTS file exercises the same
+    /// carrier), but the log names what was actually carried.
+    extensions: u32,
+}
+
+impl Pcmhd {
+    /// Add one DTS-HD frame. `Ok(None)` until three are gathered, then the dense [`PCMHD_CHUNK`]
+    /// and the timestamp it plays at. `Err` when even the core fits no type IV burst.
+    pub(crate) fn frame(&mut self, frame: &[u8], core_len: usize, pts: i64) -> Result<Option<(i64, Vec<u8>)>, ()> {
+        let mut burst = dtshd_burst(frame, core_len, true).ok_or(())?;
+        let used = 20 + usize::from(u16::from_be_bytes([burst[18], burst[19]]));
+        burst.truncate(used);
+        if self.acc.is_empty() {
+            self.first_pts = pts;
+        }
+        self.frames += 1;
+        if core_len > 0 && core_len < frame.len() {
+            self.extensions += 1;
+        }
+        self.acc.push(burst);
+        if self.acc.len() < 3 {
+            return Ok(None);
+        }
+        let period = BURST * HBR;
+        let mut out = vec![0u8; PCMHD_CHUNK];
+        for (i, b) in std::mem::take(&mut self.acc).into_iter().enumerate() {
+            out[i * period..i * period + b.len()].copy_from_slice(&b);
+        }
+        let pts = match self.next_pts {
+            Some(next) if (self.first_pts - next).abs() <= REANCHOR_NS => next,
+            _ => self.first_pts,
+        };
+        self.next_pts = Some(pts + FRAME_NS);
+        Ok(Some((pts, out)))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// `(frames packed, frames that carried an extension substream)` for the demuxer's log line.
+    pub(crate) fn summary(&self) -> (u32, u32) {
+        (self.frames, self.extensions)
     }
 }
 
@@ -779,5 +899,69 @@ mod tests {
             pts.extend(mat.au(&au, 5_000 + i64::from(k) * 833_333).unwrap());
         }
         assert_eq!(pts, vec![5_000, 5_000 + 32_000_000, 5_000 + 64_000_000]);
+    }
+
+    /// The webOS 25 carrier exists only where its caps hook was written: webOS 25. Another major
+    /// must never arm it (the ioctl carrier's own rule, for the same reason).
+    #[test]
+    fn the_pcm_carrier_is_wired_to_webos_25_only() {
+        assert!(super::pcmhd_measured(25));
+        for major in [0, 3, 4, 5, 6, 7, 10, 22, 24, 26] {
+            assert!(!super::pcmhd_measured(major), "webOS {major}: never arm the PCM carrier");
+        }
+    }
+
+    /// One chunk is exactly 32 ms of 192 kHz / 8 ch / 16-bit audio, which is what the Load
+    /// declares: a chunk that disagrees with the declaration is a receiver that loses lock.
+    #[test]
+    fn a_pcmhd_chunk_is_32_ms_of_the_declared_pcm_shape() {
+        assert_eq!(super::PCMHD_CHUNK, 192_000 * 8 * 2 * 32 / 1000);
+        assert_eq!(super::PCMHD_CHUNK, super::CHUNK * super::HBR);
+        // Three 32768-byte type IV bursts fill it with no slack.
+        assert_eq!(super::PCMHD_CHUNK, 3 * super::BURST * super::HBR);
+    }
+
+    /// Three DTS frames become one dense 98304-byte chunk on a contiguous 32 ms lattice, with the
+    /// HBR burst header (type IV, subtype 4) at each 32768-byte boundary and only zeros between.
+    #[test]
+    fn pcmhd_packs_three_bursts_into_one_fed_chunk_every_32_ms() {
+        let _g = globals();
+        let mut p = super::Pcmhd::default();
+        let mut frame = vec![0x5au8; 2568];
+        frame[..4].copy_from_slice(&[0x7f, 0xfe, 0x80, 0x01]);
+        assert_eq!(p.frame(&frame, frame.len(), 1_000_000_000), Ok(None));
+        assert_eq!(p.frame(&frame, frame.len(), 1_010_666_666), Ok(None));
+        let (pts, chunk) = p.frame(&frame, frame.len(), 1_021_333_333).unwrap().unwrap();
+        // The first frame's own timestamp anchors the chunk (stretched source timestamps stay on
+        // the carrier's 32 ms lattice, as for the C1 path).
+        assert_eq!(pts, 1_000_000_000);
+        assert_eq!(chunk.len(), super::PCMHD_CHUNK);
+        for i in 0..3 {
+            let b = &chunk[i * 32768..(i + 1) * 32768];
+            assert_eq!(b[..6], [0xf8, 0x72, 0x4e, 0x1f, 0x04, 0x11], "burst {i} header");
+            assert_eq!(b[18..20], 2568u16.to_be_bytes(), "burst {i} payload size");
+            assert_eq!(b[20..20 + 2568], frame[..]);
+            assert!(b[20 + 2568..].iter().all(|x| *x == 0), "burst {i} padding");
+        }
+        // The next chunk keeps the lattice, not the source's timestamps.
+        for _ in 0..3 {
+            let _ = p.frame(&frame, frame.len(), 5_000_000_000);
+        }
+        assert_eq!(p.summary(), (6, 0), "core-only frames are counted as such");
+    }
+
+    /// A frame that fits no type IV burst is a refusal (the demuxer fails the stream), never a
+    /// silently truncated chunk: `dtshd_burst` falls back to the core, and a core that does not
+    /// fit either is an error.
+    #[test]
+    fn pcmhd_refuses_a_frame_that_fits_no_burst() {
+        let mut p = super::Pcmhd::default();
+        let huge = vec![0u8; 40_000];
+        assert!(p.frame(&huge, 0, 0).is_err(), "no core to fall back to and the frame is too big");
+        assert!(
+            p.frame(&huge, 32_750, 0).is_err(),
+            "a core larger than the 32748-byte payload slot (32768 - 8 - 12 header bytes)"
+        );
+        assert_eq!(p.summary(), (0, 0), "a refused frame is not counted");
     }
 }
