@@ -10,8 +10,9 @@
  *   es=true, clock-x4=true, codec-str="mat", data-rate=192000, data-channels=8, data-bps=16,
  *   acmod=0, channel-mask=0xc3f, plus the sink property `pcm-multi-ch=true`.
  *
- * ARMING: nothing happens unless Rust set `nj_pcmhd_armed` (the `/tmp/nativejelly-pcmhd` trigger on
- * webOS 25 with a receiver). With it cleared, `gst_element_factory_make` is a plain forward.
+ * ARMING: nothing happens unless Rust set `nj_pcmhd_armed` (the `<runtime>/nativejelly-pcmhd`
+ * trigger on webOS 25 with a receiver; debug runtime is `/tmp/com.sostk.nativejelly.debug`).
+ * With it cleared, `gst_element_factory_make` is a plain forward.
  *
  * ABI EVIDENCE, all read from the shipped/donor binaries -- none of these numbers is recalled:
  *  - `GstMiniObject` is 36 bytes and `_GstEvent.type` is at offset 36: DWARF of the donor G5
@@ -75,6 +76,9 @@ typedef struct GstPad GstPad;
 typedef struct GstEvent GstEvent;
 typedef struct GstCaps GstCaps;
 typedef struct GstStructure GstStructure;
+
+/* This is also the exported interposer defined below. */
+GstElement *gst_element_factory_make(const char *factory, const char *name);
 
 typedef GstElement *(*make_fn)(const char *, const char *);
 typedef GstPad *(*get_pad_fn)(GstElement *, const char *);

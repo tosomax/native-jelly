@@ -10,7 +10,8 @@ Documento di riferimento per l'analisi statica che questo codice consuma:
 
 ## 1. Cosa fa il prototipo
 
-Trigger: `/tmp/nativejelly-pcmhd` (solo build `devtriggers`). Se è presente **e** il firmware è
+Trigger: `<runtime>/nativejelly-pcmhd` (solo build `devtriggers`; per la debug app
+`/tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd`). Se è presente **e** il firmware è
 webOS 25 **e** la traccia è DTS **e** l'uscita audio è un receiver (la stessa `receiver_ready` che
 governa il passthrough DTS):
 
@@ -103,7 +104,7 @@ per non dipendere dal valore di un GType non disponibile nel corpus.
 make
 make deploy
 # trigger, poi play di un titolo DTS-HD MA / DTS:X con uscita su receiver
-printf '' > /tmp/nativejelly-pcmhd
+printf '' > /tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd
 ```
 
 Log attesi:
@@ -164,3 +165,26 @@ pipeline gestita (report §6.7).
 - `Makefile` — export di `gst_element_factory_make`.
 - `ci/check-elf.sh` — asserzione che l'export sia nell'artefatto.
 - `docs/agent-reports/verify-pcmhd-carrier.py` — verifica statica riproducibile.
+
+## 7. Verifiche eseguite successivamente in Docker
+
+Il worker non aveva toolchain Rust/C sull'host. La verifica è stata ripresa in un container
+`nativejelly-test:nightly` con `rust-src`, SDL2, SDL2_ttf e GL:
+
+```text
+cargo test --lib -p nativejelly-modules player::es_carrier
+test result: ok. 13 passed; 0 failed; 1 ignored; 5421 filtered out
+
+cargo test --lib -p nativejelly-modules pcmhd
+test result: ok. 4 passed; 0 failed; 0 ignored; 5431 filtered out
+
+cargo test --lib -p nativejelly-modules dts
+test result: ok. 15 passed; 0 failed; 0 ignored; 5420 filtered out
+
+gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only src/pcmhd_sink.c
+pcmhd_sink.c: syntax/warnings OK
+```
+
+La compilazione C ha trovato e corretto un simbolo mancante: ora
+`gst_element_factory_make` ha una dichiarazione forward prima del controllo anti-ricorsione in
+`resolve()`. Restano non eseguiti il build ARM/IPK e il test end-to-end sulla TV.

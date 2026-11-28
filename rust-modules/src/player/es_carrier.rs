@@ -20,7 +20,8 @@
 //! (`libgstlgaudiosink.so`), which takes `audio/x-raw` caps and calls `lgao_feed` with
 //! `LGAO_DATA_PCM` unless the caps carry their extra bitstream fields; `ioctl(0x40285207)` exists in
 //! none of that firmware's libraries (`docs/agent-reports/es-carrier-webos25.md`). The diagnostic
-//! answer here is a **PCM carrier**, dev-trigger only (`/tmp/nativejelly-pcmhd`, webOS 25 only):
+//! answer here is a **PCM carrier**, dev-trigger only (`<runtime>/nativejelly-pcmhd`, webOS 25 only;
+//! `/tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd` for the debug app):
 //! the Load declares `PCM` S16LE 192 kHz 8 ch, the demuxer FEEDS the same three-burst 98304-byte
 //! chunks every 32 ms as raw PCM, and `src/pcmhd_sink.c` rewrites the caps event on the `audiosink`
 //! so the sink treats those bytes as an IEC 61937 bitstream. Nothing here is enabled by default and
