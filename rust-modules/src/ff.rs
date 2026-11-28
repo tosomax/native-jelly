@@ -3979,6 +3979,25 @@ fn dts_core_channels(core: &[u8]) -> Option<u32> {
     AMODE_CHANNELS.get(usize::from(amode)).map(|ch| ch + lfe)
 }
 
+/// Sample rate and PCM block count from a normalized DTS core header. The SFCODE table is
+/// FFmpeg 9.0's `ff_dca_sample_rates` (ETSI TS 102 114); zero entries are reserved. This is the
+/// evidence used to admit only 48 kHz / 16 blocks = 512 samples to the fixed 32 ms PCM carrier.
+fn dts_core_timing(core: &[u8]) -> Option<crate::player::es_carrier::DtsTiming> {
+    use crate::player::es_carrier::DtsTiming;
+    let header = core.get(..9)?;
+    if header[..4] != [0x7f, 0xfe, 0x80, 0x01] {
+        return None;
+    }
+    // DEFSIC is stored minus one and must name a full 32-sample PCM block.
+    if (header[4] >> 2) & 0x1f != 31 {
+        return None;
+    }
+    let blocks = (((u16::from(header[4]) << 8) | u16::from(header[5])) >> 2 & 0x7f) + 1;
+    const RATES: [u32; 16] = [0, 8_000, 16_000, 32_000, 0, 0, 11_025, 22_050, 44_100, 0, 0, 12_000, 24_000, 48_000, 96_000, 192_000];
+    let sample_rate = *RATES.get(usize::from((header[8] >> 2) & 0x0f))?;
+    (sample_rate != 0).then_some(DtsTiming { sample_rate, blocks })
+}
+
 /// One 48 kHz DTS core frame as an IEC 61937 burst, little-endian S16 stereo: the bytes FFmpeg's
 /// spdif muxer writes and dts_restore_plus's passthrough feeds LG's PCM input. A receiver on S/PDIF
 /// or ARC sees the original DTS bitstream; nothing is decoded. `None` when the core is not 48 kHz,
@@ -4008,7 +4027,7 @@ fn dts_iec61937(core: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod dts_core_tests {
-    use super::{dts_core_channels, dts_core_packet};
+    use super::{dts_core_channels, dts_core_packet, dts_core_timing};
 
     /// A 5.1 core (FFmpeg's encoder: AMODE 9, LFF 2) reads six channels, stereo two; AMODE 13
     /// (7 channels) and a user-defined AMODE do not fit.
@@ -4056,6 +4075,32 @@ mod dts_core_tests {
         let mut frame = vec![0x55; 128];
         frame[..10].copy_from_slice(&[0x7f, 0xfe, 0x80, 0x01, 0xfc, 0x00, 0x07, 0xf0, 0, 0]);
         frame
+    }
+
+    #[test]
+    fn timing_reads_rate_and_blocks_and_rejects_reserved_or_nonstandard_headers() {
+        let mut frame = core();
+        frame[5] = 0x3c; // NBLKS=15 -> 16 blocks
+        frame[8] = 13 << 2;
+        let timing = dts_core_timing(&frame).unwrap();
+        assert_eq!((timing.sample_rate, timing.blocks), (48_000, 16));
+        assert!(timing.supported());
+        for (code, rate) in [(6, 11_025), (7, 22_050), (8, 44_100), (11, 12_000), (12, 24_000), (14, 96_000), (15, 192_000)] {
+            frame[8] = code << 2;
+            let timing = dts_core_timing(&frame).unwrap();
+            assert_eq!(timing.sample_rate, rate);
+            assert!(!timing.supported(), "rate {rate} must not enter the fixed 32 ms carrier");
+        }
+        frame[8] = 13 << 2;
+        frame[4] = 0xbc; // NBLKS=15 -> 16 blocks, but DEFSIC is not a full 32-sample block
+        assert!(dts_core_timing(&frame).is_none());
+        frame[4] = 0xfc;
+        frame[5] = 17; // NBLKS=17 -> 18 blocks
+        let timing = dts_core_timing(&frame).unwrap();
+        assert_eq!(timing.blocks, 18);
+        assert!(!timing.supported());
+        frame[8] = 0; // reserved SFCODE
+        assert!(dts_core_timing(&frame).is_none());
     }
 
     #[test]
@@ -9490,7 +9535,34 @@ pub(crate) fn demux(
                 let mut carrier = crate::player::es_carrier::Packer::default();
                 // webOS 25 (dev trigger only): there is no renderer write to swap, so the SAME
                 // bursts are fed as raw PCM into the 192 kHz/8-channel Load the engine declared.
-                let pcmhd = dts_audio && crate::player::es_carrier::pcmhd();
+                // Both the container and every core header must prove the one supported timing.
+                let pcmhd_requested = dts_audio && crate::player::es_carrier::pcmhd();
+                let pcmhd = if pcmhd_requested {
+                    let rate = (*stream_codecpar(*streams.add(ai as usize))).sample_rate;
+                    if !dts_iec || rate != 48_000 {
+                        crate::player::log(&format!(
+                            "ff: PCM carrier refused — DTS receiver route={dts_iec} container rate={rate}, need 48000"
+                        ));
+                        crate::player::es_carrier::set_pcmhd(false);
+                        SHARED.native_audio_header_refused.store(true, Ordering::Release);
+                        SHARED.demux_failed.store(true, Ordering::Release);
+                        avformat_close_input(&mut fmt);
+                        free_avio(avio);
+                        break;
+                    }
+                    if !crate::player::es_carrier::pcmhd_wait_ready() {
+                        crate::player::log("ff: PCM carrier refused — sink did not accept carrier CAPS; no carrier bytes fed");
+                        crate::player::es_carrier::set_pcmhd(false);
+                        SHARED.native_audio_header_refused.store(true, Ordering::Release);
+                        SHARED.demux_failed.store(true, Ordering::Release);
+                        avformat_close_input(&mut fmt);
+                        free_avio(avio);
+                        break;
+                    }
+                    true
+                } else {
+                    false
+                };
                 let mut pcmhd_packer = crate::player::es_carrier::Pcmhd::default();
                 let mut pcmhd_chunks = 0u32;
                 if es_carrier {
@@ -9800,6 +9872,43 @@ pub(crate) fn demux(
                     }
                     let r = av_read_frame(fmt, pkt);
                     if frame_read_failed(&mut state, r) {
+                        // Flush one or two accumulated DTS frames only on natural EOF. A transport
+                        // error or teardown must not splice stale pre-seek audio into the next epoch.
+                        if pcmhd && crate::player::es_carrier::pcmhd() && r == AVERROR_EOF && !state.io_failed && !crate::aq::aq_is_aborted(aq_p) {
+                            if let Some((pts, chunk)) = pcmhd_packer.finish() {
+                                if headroom.first_audio_ns.is_none() {
+                                    SHARED.first_audio_pts.store(pts, Ordering::Release);
+                                }
+                                let gate = audio_push_gate(aq_p, headroom.video_reach_ns());
+                                let pushed = crate::aq::aq_push_gated(
+                                    aqa_p,
+                                    chunk.as_ptr(),
+                                    chunk.len() as c_int,
+                                    pts,
+                                    1,
+                                    2,
+                                    gate,
+                                    || state.drain_wire(),
+                                );
+                                if pushed != 0 {
+                                    if !crate::aq::aq_is_aborted(aq_p) {
+                                        SHARED.demux_io_failed.store(true, Ordering::Release);
+                                        SHARED.demux_failed.store(true, Ordering::Release);
+                                    }
+                                    break;
+                                }
+                                let step = headroom.after_audio(pts);
+                                if step.release {
+                                    crate::aq::aq_release_headroom(aq_p);
+                                }
+                                SHARED.hls_audio_tail_ns.store(pts, Ordering::Release);
+                                pcmhd_chunks += 1;
+                                let (frames, extensions) = pcmhd_packer.summary();
+                                crate::player::log(&format!(
+                                    "ff: PCM carrier EOF flush — {pcmhd_chunks} chunks, {frames} DTS frames, {extensions} extensions"
+                                ));
+                            }
+                        }
                         // Genuine end of stream, teardown, or an unrecovered I/O error published by
                         // `frame_read_failed`. NOT an app seek — that is serviced at the top of this
                         // loop and never surfaces as a read error.
@@ -9977,10 +10086,59 @@ pub(crate) fn demux(
                             }
                         }
                         if pcmhd {
-                            // The core length is only a fallback for a frame too wide for its
-                            // 32768-byte burst, exactly as on the C1 path.
-                            let core_len = dts_core_packet(raw).map_or(0, |c| c.len());
-                            match pcmhd_packer.frame(raw, core_len, pts) {
+                            if !crate::player::es_carrier::pcmhd() {
+                                crate::player::log("ff: PCM carrier disarmed after sink refusal; refusing audio feed");
+                                SHARED.demux_failed.store(true, Ordering::Release);
+                                SHARED.demux_io_failed.store(true, Ordering::Release);
+                                av_packet_unref(pkt);
+                                break;
+                            }
+                            // A complete normalized core proves both the rate and the 512-sample
+                            // block count. Its length is also the oversized-frame fallback.
+                            let Some(core) = dts_core_packet(raw) else {
+                                crate::player::log("ff: PCM carrier: DTS packet has no complete core; refusing audio feed");
+                                crate::player::es_carrier::set_pcmhd(false);
+                                SHARED.demux_failed.store(true, Ordering::Release);
+                                SHARED.demux_io_failed.store(true, Ordering::Release);
+                                av_packet_unref(pkt);
+                                break;
+                            };
+                            let Some(timing) = dts_core_timing(&core) else {
+                                crate::player::log("ff: PCM carrier: malformed DTS timing header; refusing audio feed");
+                                crate::player::es_carrier::set_pcmhd(false);
+                                SHARED.demux_failed.store(true, Ordering::Release);
+                                SHARED.demux_io_failed.store(true, Ordering::Release);
+                                av_packet_unref(pkt);
+                                break;
+                            };
+                            if !timing.supported() {
+                                crate::player::log(&format!(
+                                    "ff: PCM carrier refused — DTS timing {} Hz/{} blocks is not 48000/16",
+                                    timing.sample_rate, timing.blocks
+                                ));
+                                crate::player::es_carrier::set_pcmhd(false);
+                                SHARED.demux_failed.store(true, Ordering::Release);
+                                SHARED.demux_io_failed.store(true, Ordering::Release);
+                                av_packet_unref(pkt);
+                                break;
+                            }
+                            let packet_ns = if (*pkt).duration > 0 {
+                                av_rescale_q((*pkt).duration, stream_time_base(ast), NS_TB)
+                            } else {
+                                0
+                            };
+                            let expected_ns = crate::player::es_carrier::FRAME_NS / 3;
+                            if packet_ns > 0 && (i128::from(packet_ns) - i128::from(expected_ns)).abs() > 1_000_000 {
+                                crate::player::log(&format!(
+                                    "ff: PCM carrier refused — DTS packet duration {packet_ns} ns is not 512 samples at 48 kHz"
+                                ));
+                                crate::player::es_carrier::set_pcmhd(false);
+                                SHARED.demux_failed.store(true, Ordering::Release);
+                                SHARED.demux_io_failed.store(true, Ordering::Release);
+                                av_packet_unref(pkt);
+                                break;
+                            }
+                            match pcmhd_packer.frame(raw, core.len(), timing, pts) {
                                 Ok(Some(au)) => {
                                     pcmhd_au = Some(au);
                                     pcmhd_chunks += 1;
@@ -9998,6 +10156,7 @@ pub(crate) fn demux(
                                 Ok(None) => {}
                                 Err(()) => {
                                     crate::player::log("ff: PCM carrier: DTS-HD frame fits no type IV burst; refusing audio feed");
+                                    crate::player::es_carrier::set_pcmhd(false);
                                     SHARED.demux_failed.store(true, Ordering::Release);
                                     SHARED.demux_io_failed.store(true, Ordering::Release);
                                     av_packet_unref(pkt);

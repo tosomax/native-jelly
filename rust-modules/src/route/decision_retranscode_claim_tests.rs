@@ -43,6 +43,7 @@ fn install(ps: &mut PlaybackSession, lb: &JfLoopback) {
                 ordinal: 0,
                 codec: "eac3".into(),
                 channels: 6,
+                sample_rate: 0,
                 can_normalize_loudness: false,
                 immersive: false,
             }),

@@ -251,6 +251,7 @@ pub fn stream(s: &MediaStream, item_guid: &str, source_id: &str) -> Stream {
         profile: s.profile.clone().unwrap_or_default().to_ascii_lowercase(),
         bit_depth: s.bit_depth.unwrap_or(0),
         channels: s.channels.unwrap_or(0),
+        sample_rate: s.sample_rate.unwrap_or(0),
         audio_channel_layout: s.channel_layout.clone().unwrap_or_default(),
         display_title: s.display_title.clone().unwrap_or_default(),
         title: s.title.clone().unwrap_or_default(),
@@ -613,7 +614,7 @@ mod tests {
                 {"Type":"Video","Index":0,"Codec":"hevc","Width":3840,"Height":1608,"VideoRangeType":"DOVIWithHDR10",
                  "ColorTransfer":"smpte2084","Profile":"Main 10","BitDepth":10,"RealFrameRate":23.976},
                 {"Type":"Audio","Index":1,"Codec":"truehd","Language":"eng","Channels":8,"IsDefault":true},
-                {"Type":"Audio","Index":2,"Codec":"dts","Language":"ger","Channels":6},
+                {"Type":"Audio","Index":2,"Codec":"dts","Language":"ger","Channels":6,"SampleRate":48000},
                 {"Type":"Subtitle","Index":3,"Codec":"PGSSUB","Language":"fre","IsForced":true},
                 {"Type":"Subtitle","Index":4,"Codec":"subrip","Language":"eng","IsExternal":true}
               ]}]
@@ -668,6 +669,7 @@ mod tests {
         assert_eq!(s[0].dovi_present, 1);
         assert_eq!(s[0].dovi_bl_compat_id, 1);
         assert_eq!(s[2].codec, "dca");
+        assert_eq!(s[2].sample_rate, 48_000);
         assert_eq!((s[1].language.as_str(), s[1].language_code.as_str(), s[1].language_tag.as_str()), ("English", "eng", "en"));
         assert_eq!(s[3].codec, "pgs");
         assert_eq!(s[3].forced, 1);

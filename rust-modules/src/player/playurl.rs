@@ -59,6 +59,10 @@ pub(crate) struct PlayUrl {
     /// legacy codecs; Opus requires mono/stereo rather than guessing a header.
     #[serde(default)]
     pub(crate) achannels: i64,
+    /// Explicit source sample rate in Hz. The diagnostic DTS PCM carrier requires
+    /// `48000`; zero means unknown and therefore refuses that carrier.
+    #[serde(default)]
+    pub(crate) asample_rate: i64,
     /// Explicit permission for a bounded 3–8 channel pipeline experiment. This
     /// does not affect Auto/Force capabilities and is unavailable without dev triggers.
     #[serde(default)]

@@ -87,6 +87,7 @@ fn apply_plan_installs_contract_outcome_audio() {
         ordinal: 2,
         codec: "truehd".into(),
         channels: 8,
+        sample_rate: 0,
         can_normalize_loudness: true,
         immersive: false,
     };

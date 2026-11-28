@@ -1,190 +1,176 @@
-# PCM carrier DTS-HD/X su webOS 25 — prototipo diagnostico (branch `dts-pcm-carrier-spike`)
+# PCM carrier DTS-HD/X su webOS 25 — prototipo diagnostico fail-closed
 
-Data: 28/11/2026. Worktree `/tmp/opencode/nj-pcm-carrier`, base `v011-debug`. Nessuna TV usata,
-nessun push. Il codice è un **esperimento dev**, non un default di produzione.
+Data: 28/11/2026. Branch `dts-pcm-carrier-spike`, base `55d15b6b`.
+Nessuna TV usata, nessun push, nessuna build nella revisione correttiva. Il codice resta un
+**esperimento dev**, non un default di produzione e non una capacità dichiarata verificata.
 
-Documento di riferimento per l'analisi statica che questo codice consuma:
-`docs/agent-reports/es-carrier-webos25.md` (percorso ES, caps del sink, tabella risorse).
-
----
-
-## 1. Cosa fa il prototipo
-
-Trigger: `<runtime>/nativejelly-pcmhd` (solo build `devtriggers`; per la debug app
-`/tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd`). Se è presente **e** il firmware è
-webOS 25 **e** la traccia è DTS **e** l'uscita audio è un receiver (la stessa `receiver_ready` che
-governa il passthrough DTS):
-
-1. **Load** — `audio: "PCM"`, `pcmInfo` S16LE / `8-channel` / interleaved / 192 kHz / 16 bit
-   (`engine::with_pcmhd_info`, applicato dopo il nodo stereo 48k di `with_iec_pcm_info`).
-2. **Feed** — il demuxer impacchetta ogni frame DTS-HD in un burst IEC 61937 type IV da 32768 B
-   (subtype 4, big-endian) e ne consegna **tre per AU** = 98304 B, PTS contigui ogni 32 ms
-   (`es_carrier::Pcmhd`). È lo stesso chunk che il percorso C1 accoda per lo swap; qui viene
-   *feedato* come PCM, perché su webOS 25 non esiste la scrittura ES da intercettare.
-3. **Caps** — `src/pcmhd_sink.c` esporta `gst_element_factory_make`. Quando libpf crea
-   `audiosink` con il modo armato, mette una probe `EVENT_DOWNSTREAM|EVENT_FLUSH` sul pad `sink`,
-   chiede `pcm-multi-ch=true` e sostituisce l'evento CAPS `audio/x-raw S16LE 192 kHz 8 ch` con:
-
-   ```
-   audio/x-raw, format=(string)S16LE, layout=(string)interleaved, rate=(int)192000,
-   channels=(int)8, channel-mask=(bitmask)0xc3f, acmod=(uint)0, es=(boolean)true,
-   codec-str=(string)mat, clock-x4=(boolean)true, data-rate=(int)192000,
-   data-channels=(int)8, data-bps=(int)16
-   ```
-
-   È la variante che dts_restore_plus chiama **PCM carrier**: il buffer **non** porta il flag
-   `1<<21` (quello è la variante native ES), quindi il sink resta su `LGAO_DATA_PCM`.
-   `pcm-bypass` non viene toccato: `set_pcm` di dts_restore_plus imposta solo `pcm-multi-ch` per il
-   PCM carrier, mentre `pcm-bypass` è impostata da libpf in `DirectMediaPlayer::createAudioPath`.
-4. **Teardown** — `set_pcmhd(false)` accanto a `set_on(false)`: la probe resta installata ma passa
-   tutto finché `nj_pcmhd_armed` è 0, e il Load successivo riparte dalla decisione.
-
-Nessun ADEC, nessun `601`, nessun `dtsInfo`/`ac3PlusInfo`, nessun lease `earc_route`, nessun ioctl.
-
-**Fuori scope**: TrueHD/MAT. Il percorso MAT esistente resta quello C1 (chunk da 98304 B accodati per
-lo swap); le caps sarebbero le stesse, ma il feed denso dei chunk MAT in questa modalità non è
-implementato né provato. Il trigger riguarda solo DTS.
+Documento di riferimento per l'analisi statica: `docs/agent-reports/es-carrier-webos25.md`.
+Correzioni della review indipendente: `docs/agent-reports/pcmhd-carrier-review-fixes.md`.
 
 ---
 
-## 2. Evidenza ABI usata (nessun numero a memoria)
+## 1. Contratto attuale
 
-| Fatto | Valore | Prova |
-|---|---|---|
-| `_GstEvent.type` offset | 36 | DWARF `libgstlgaudiosink.so` donor G5: `_GstEvent` byte_size 56, `type` @36 |
-| `GST_EVENT_CAPS` | 12814 | stesso DWARF, enumeratore `GstEventType` |
-| `GstMiniObject` size | 36 | stesso DWARF (i flag buffer, se servissero, sono a @12) |
-| `GstPadProbeInfo.data` offset | 8 | `event_probe` compilato in dts_restore_plus `out/libgstdtsdec.so`: `ldr r5,[r1,#8]`, poi `ldr r0,[r5,#0x24]` |
-| maschera probe | 0x140 | `gst_pad_add_probe` in `lgroute_arm`: `mov r1,#0x140` (EVENT_DOWNSTREAM\|EVENT_FLUSH) |
-| `GST_PAD_PROBE_OK` / `DROP` / `REMOVE` | 0 / 1 / 2 | ritorni compilati di `event_probe`/`buffer_probe` confrontati col sorgente |
-| `_GTypeInstance.g_class` @0, `_GObject.g_type_instance` @0 | GObject 12 B | DWARF dello stesso sink donor |
-| soname | `libgstreamer-1.0.so.0`, `libgobject-2.0.so.0` | `readelf -d libpf.so` NEEDED |
-| simboli risolti | vedi `src/pcmhd_sink.c` | tutti import dinamici di `libpf.so`/`libgstdecproxy.so` (`readelf --dyn-syms`), quindi esistono su questo firmware |
+Trigger: `<runtime>/nativejelly-pcmhd` (solo build `devtriggers`; debug app:
+`/tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd`). Il carrier può armarsi solo se:
 
-`gst_caps_from_string` è usato al posto di `gst_caps_new_simple` (varargs con `GST_TYPE_BITMASK`)
-per non dipendere dal valore di un GType non disponibile nel corpus.
+1. firmware webOS 25;
+2. traccia DTS e uscita audio su receiver;
+3. il route porta un sample rate **noto e pari a 48000 Hz**;
+4. il payload PCM 192 kHz/8ch viene trasformato esattamente;
+5. il demuxer legge dal core DTS normalizzato **16 blocchi × 32 campioni = 512 campioni**;
+6. la probe C accetta le caps carrier prima del primo chunk audio.
 
----
+Ogni condizione mancante rifiuta il percorso. In particolare, un sample rate sconosciuto non viene
+assunto, un header non 48k/512 non viene ritemporizzato, e un hook mai intercettato non può far
+passare rumore PCM.
 
-## 3. Cosa è provato e cosa no
+### Load
 
-**Provato staticamente**
+`audio: "PCM"`, `pcmInfo` S16LE / `8-channel` / interleaved / 192 kHz / 16 bit.
+`with_pcmhd_info()` ora restituisce `Result`: richiede esattamente un nodo stereo, nessun nodo già
+wide, JSON valido e il nodo finale esatto. Un fallimento interrompe lo start.
 
-- Il percorso ES webOS 25 è il sink `audiosink`, non `ioctl(0x40285207)` (report §2-3).
-- Il Load PCM 192k/8ch è esprimibile: `setPCMinfo` accetta `N-channel` (`sscanf("%2d-channel")`) e
-  `sampleRate` in kHz; la maschera risorse per `audio/x-raw` è 4 → chiave `"pcm"` assente → lista
-  ADEC vuota (report §4).
-- Il sink accetta `audio/x-raw` fino a 384 kHz / 10 canali e i campi caps extra (template @0x1fab4).
-- Il chunk 98304 B = 192000 × 8 × 2 × 32 ms e = 3 × 32768 B (test host + verifier).
-- `codec-str` noto = `"mat"`; `LGAO_CODEC_T` non ha DTS (report §2.2).
+### Feed
 
-**Non provato (da falsificare sul device)**
+Il demuxer impacchetta ogni frame DTS-HD in un burst IEC 61937 type IV da 32768 B (subtype 4,
+big-endian) e consegna tre burst per AU = 98304 B, PTS contigui ogni 32 ms. La durata è derivata dal
+core DTS, non dal nome codec. Se `AVPacket.duration` è presente, deve anch'esso corrispondere a
+512 campioni a 48 kHz (tolleranza di rounding 1 ms).
 
-- Che libpf accetti/allocchi un Load PCM 192k/8ch senza ADEC a questa larghezza (a 48k/2ch funziona,
-  misurato).
-- Che la negoziazione arrivi al sink come `audio/x-raw 192000 8` e non venga normalizzata da un
-  `audioconvert` a 48k/2ch. La probe logga le caps realmente viste e non riscrive se non combaciano.
-- **Il passo meno solido**: sostituire le caps inviando un evento CAPS *direttamente sul pad* del sink
-  dentro la sua probe e scartando l'originale. `gst_pad_send_event` su quel pad è ciò che
-  dts_restore_plus fa per `STREAM_START`, e i suoi commenti dicono che caps *diverse* riaprono il
-  renderer LG; ma il loro carrier arriva normalmente come caps del srcpad di un elemento, cosa che
-  qui non è possibile. Va confermato con `pcmhd-sink.log` + AVR.
-- Che il sink di questo esemplare (33.31.68) sia il build donor verificato: il file esatto non è nel
-  corpus. La probe logga il percorso e non fa hash-check (dts_restore_plus lo fa nel boot script).
-- Che l'interposizione di `gst_element_factory_make` avvenga: provata dal meccanismo `ioctl` già in
-  uso, ma va vista nei log (`audiosink found`).
-- eARC/policy: senza `Digital Sound Output = Pass Through` la TV può mixare. Fuori scope qui.
+A EOF naturale, `Pcmhd::finish()` emette anche l'ultimo gruppo parziale da uno o due frame. L'AU
+resta un chunk PCM fisso da 32 ms; gli slot burst inutilizzati sono zeri. Su seek il packer viene
+resettato; su errore di trasporto o teardown non viene fatto il flush.
 
----
+### Caps C
 
-## 4. Come si esegue (quando c'è una TV)
+`src/pcmhd_sink.c` esporta `gst_element_factory_make` solo nelle build `devtriggers`. Quando libpf
+crea `audiosink` con il modo armato:
+
+1. ottiene il pad `sink` con `gst_element_get_static_pad` (una reference transfer-full);
+2. installa una probe `EVENT_DOWNSTREAM|EVENT_FLUSH`;
+3. imposta `pcm-multi-ch=true`;
+4. valida le caps in ingresso campo per campo;
+5. sostituisce solo `audio/x-raw S16LE 192000 8ch` con:
 
 ```
-# build debug (FLAVOR=debug è il default tracciato)
-make
-make deploy
-# trigger, poi play di un titolo DTS-HD MA / DTS:X con uscita su receiver
-printf '' > /tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd
+audio/x-raw, format=(string)S16LE, layout=(string)interleaved, rate=(int)192000,
+channels=(int)8, channel-mask=(bitmask)0xc3f, acmod=(uint)0, es=(boolean)true,
+codec-str=(string)mat, clock-x4=(boolean)true, data-rate=(int)192000,
+data-channels=(int)8, data-bps=(int)16
 ```
 
-Log attesi:
+`es` assente, `es=false`, `es` non booleano oppure `es=true` con campi carrier incompleti/sbagliati
+richiedono tutti la riscrittura. Solo `es=true` con **tutti** i valori attesi bypassa la riscrittura.
 
-- `/tmp/nativejelly-events.log`
-  - `load: ... a="PCM" ...`
-  - `start_bufferfeed: PCM carrier armed by /tmp/nativejelly-pcmhd: ...`
-  - `ff: PCM carrier: DTS-HD frames as three 32768-byte ...`
-  - `ff: PCM carrier N chunks of 98304 B (3N DTS frames, E with an extension substream, ...)`
-  - **nessun** `smp_cb type=18 num=601`
-- `/tmp/nativejelly-pcmhd-sink.log`
-  - `symbols resolved`
-  - `audiosink found: probe ... pcm-multi-ch requested`
-  - `caps rewritten to the carrier ...`
-  - oppure `sink got audio/x-raw 48000 2 ... caps NOT rewritten` (negoziazione diversa: il test
-    fallisce in modo diagnosticabile, non silenzioso)
+Se `gst_pad_send_event()` rifiuta la caps sostitutiva, la probe restituisce `GST_PAD_PROBE_OK`:
+l'evento originale non viene droppato. Rust viene disarmato e il demuxer non alimenta altro carrier.
+Se l'invio riesce, la probe droppa l'originale e segnala a Rust che il downstream ha accettato le
+caps carrier.
 
-Se compare `cannot find ADEC or PCMMC` la via PCM non passa: tornare alla patch ADEC o alla
-pipeline gestita (report §6.7).
+### Handshake e rollback
+
+- `PcmhdStartGuard` azzera lo stato all'ingresso di ogni start nativo e lo disarm a su ogni uscita
+  d'errore; il commit avviene solo dopo l'installazione dell'Engine.
+- Il demuxer attende fino a 10 s il conferma `PCMHD_SINK_READY`. Mancata interposizione, caps mai
+  negoziate, proprietà mancante o rifiuto producono un errore prima del primo chunk.
+- Le callback C portano una generazione: una callback vecchia non può armare/disarmare una nuova
+  sessione.
+- `nj_pcmhd_disarm()` rimuove la probe e rilascia il reference del pad a ogni stop/start.
 
 ---
 
-## 5. Rischi
+## 2. ABI e API pubbliche
 
-1. **Rumore a pieno volume** se la caps non vengono riscritte: la TV decodifica 98304 B di carrier
-   come PCM. Il trigger è esplicito e il log dice se la riscrittura è avvenuta; non armarlo su un
-   impianto a volume alto.
-2. **Read-ahead audio**: il carrier è 3 MB/s, quindi la coda audio (cap in BYTE, 1 MiB) terrebbe
-   ~0,34 s. In questo modo dev la coda è creata a 4 MiB (`engine::start_bufferfeed_inner`, solo quando
-   `es_carrier::pcmhd()` è vero) per tornare agli stessi secondi del percorso C1. `abr/sim.rs`
-   continua a modellare 1 MiB: coerente perché il carrier è solo direct play, ma è una divergenza
-   consapevole.
-3. **Interposizione globale** di `gst_element_factory_make`: con il modo spento è un forward con una
-   load atomica; con il modo acceso tocca solo il factory `audiosink`. Se una build futura creasse il
-   sink con `gst_element_factory_create` (anch'esso importato da libpf), l'hook non lo vedrebbe e il
-   log direbbe solo che nessun `audiosink` è stato visto.
-4. **Refcount/probe**: la probe è rimossa e il pad dereferenziato quando un nuovo `audiosink` viene
-   creato; tra due playback resta un ref al pad dell'ultimo sink. Il pad è posseduto dall'elemento,
-   che libpf distrugge all'Unload: il ref tiene vivo il pad, non l'elemento. Accettabile per un
-   prototipo, da rivedere se il modo diventasse permanente.
-5. **`with_pcmhd_info` è una sostituzione testuale**: un cambio di `with_iec_pcm_info` la fa fallire
-   in silenzio. Il `debug_assert_ne!` la fa esplodere nei test, non sul device.
-6. **Il carrier non è "lossless" di per sé**: il trigger non ispeziona il profilo (la route non lo
-   espone). I frame senza estensione sono DTS core, conteggiati nel log; il carrier funziona, ma il
-   test DTS-HD/X va fatto con un file che ha l'estensione.
-7. **Nessun test end-to-end senza TV**: l'unica verifica eseguibile qui è statica/host.
+La revisione non legge più `GstPadProbeInfo.data` o `GstEvent.type` a offset hard-coded. Usa:
+
+- `gst_pad_probe_info_get_event()`;
+- `gst_event_get_type()` + `gst_event_type_get_name()` (nessun valore enum numerico);
+- `g_type_from_name()` + `g_type_instance_get_class()` per la classe GObject;
+- `gst_structure_get_boolean/int/uint/uint64/string()` per validare i campi;
+- `gst_pad_remove_probe()` con il prototipo pubblico `void`.
+
+Restano numeriche solo le costanti pubbliche `GstPadProbeType` e `GstPadProbeReturn` usate dalla
+probe (0x140, OK=0, DROP=1). La semantica del sink LG e il suo parsing delle caps restano non
+provati sul firmware 33.31.68; l'API pubblica elimina il rischio di leggere strutture con il layout
+donor, non dimostra il comportamento del renderer.
 
 ---
 
-## 6. File
+## 3. Interposizione e artefatto
 
-- `rust-modules/src/player/es_carrier.rs` — `PCMHD_CHUNK`, `Pcmhd`, `set_pcmhd`/`pcmhd`,
-  `nj_pcmhd_armed`, gating webOS 25, test host (dimensione/timing/burst/rifiuti).
-- `rust-modules/src/player/engine.rs` — decisione dev, `with_pcmhd_info`, disarmo al teardown, test
-  del payload.
-- `rust-modules/src/ff.rs` — feed dei chunk PCMHD, conteggi di log, reset al seek.
-- `src/pcmhd_sink.c` — hook C (factory → probe → caps + `pcm-multi-ch`).
-- `Makefile` — export di `gst_element_factory_make`.
-- `ci/check-elf.sh` — asserzione che l'export sia nell'artefatto.
-- `docs/agent-reports/verify-pcmhd-carrier.py` — verifica statica riproducibile.
+- `Makefile` compila `src/pcmhd_sink.c` ed esporta `gst_element_factory_make` solo se
+  `devtriggers` è nel set di feature effettivo.
+- `ci/check-elf.sh` riceve `PCMHD_HOOK=1` per il job dev e richiede l'export esattamente una volta;
+  con `PCMHD_HOOK=0` richiede che il simbolo sia assente.
+- Il gate ELF prova l'export, **non** il callsite di libpf. Se libpf usasse
+  `gst_element_factory_create` o una risoluzione non interponibile, l'handshake non diventerebbe
+  pronto e il carrier non verrebbe alimentato.
+- `ci/pcmhd-sink-test.c` è un harness host con `dlopen/dlsym` link-wrapped: prova il forwarding
+  disarmato, la separazione dei simboli, caps `es` false/incomplete, rifiuto CAPS, refcount del pad e
+  disarmo. `ci/test-pcmhd-sink.sh` contiene il comando di build/run; **non è stato eseguito** in
+  questa lane.
 
-## 7. Verifiche eseguite successivamente in Docker
+---
 
-Il worker non aveva toolchain Rust/C sull'host. La verifica è stata ripresa in un container
-`nativejelly-test:nightly` con `rust-src`, SDL2, SDL2_ttf e GL:
+## 4. Log attesi
 
-```text
-cargo test --lib -p nativejelly-modules player::es_carrier
-test result: ok. 13 passed; 0 failed; 1 ignored; 5421 filtered out
+`/tmp/nativejelly-events.log`:
 
-cargo test --lib -p nativejelly-modules pcmhd
-test result: ok. 4 passed; 0 failed; 0 ignored; 5431 filtered out
+- `load: ... a="PCM" ...`;
+- `start_bufferfeed: PCM carrier armed ... waiting for accepted sink CAPS`;
+- `ff: PCM carrier ...`;
+- in caso di rifiuto: `PCM carrier refused ...` e nessun feed carrier.
 
-cargo test --lib -p nativejelly-modules dts
-test result: ok. 15 passed; 0 failed; 0 ignored; 5420 filtered out
+`/tmp/nativejelly-pcmhd-sink.log`:
 
-gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only src/pcmhd_sink.c
-pcmhd_sink.c: syntax/warnings OK
-```
+- `symbols resolved through public GStreamer/GObject APIs`;
+- `audiosink found: probe ...`;
+- una riga `sink CAPS ...` con nome, format, layout, rate, channels, `es`, `clock-x4`, codec e
+  campi data;
+- `replacement carrier CAPS accepted downstream (send_event=1); original dropped`;
+- oppure `REFUSED ...`.
 
-La compilazione C ha trovato e corretto un simbolo mancante: ora
-`gst_element_factory_make` ha una dichiarazione forward prima del controllo anti-ricorsione in
-`resolve()`. Restano non eseguiti il build ARM/IPK e il test end-to-end sulla TV.
+La riga di accettazione dimostra il ritorno del downstream, non che il parser LG abbia decodificato
+correttamente. La conferma finale resta AVR + log device.
+
+---
+
+## 5. Rischi residui
+
+1. **Rumore/full-scale**: resta un rischio device finché caps e renderer LG non sono provati. Il
+   trigger è esplicito e il feed ora è bloccato prima dell'accettazione CAPS.
+2. **Sink target**: il file esatto `libgstlgaudiosink.so` 33.31.68 non è nel corpus. Nessun hash
+   allowlist è stato inventato.
+3. **Callsite**: l'interposizione effettiva di libpf non è dimostrata staticamente; il timeout
+   fail-closed impedisce il feed ma non prova il percorso.
+4. **EOF**: l'ultimo chunk parziale è padded a 32 ms; può aggiungere silenzio finale, ma non perde
+   frame DTS.
+5. **Read-ahead**: il carrier è 3 MB/s; la coda audio passa a 4 MiB solo in questa modalità diretta.
+6. **TrueHD/MAT**: fuori scope. Il trigger riguarda solo DTS.
+7. **Verifiche**: nessuna build Rust/C/ARM, nessun test host eseguito, nessun IPK, nessuna TV.
+
+---
+
+## 6. File principali
+
+- `rust-modules/src/player/es_carrier.rs` — atomici C, handshake, timing supportato, packer, EOF.
+- `rust-modules/src/player/engine.rs` — guard di rollback, gate sample rate, payload fail-closed.
+- `rust-modules/src/player/ff.rs` — validazione container/core/packet, attesa caps, flush EOF.
+- `rust-modules/src/{catalog/models.rs,jf/convert.rs,metadata.rs,route/*.rs}` — sample rate sorgente
+  conservato nel route e nella snapshot della traccia.
+- `src/pcmhd_sink.c` — hook C pubblico, caps validation, refcount, disarmo.
+- `Makefile`, `ci/check-elf.sh`, `.github/workflows/ci.yml` — gate feature-aware.
+- `ci/pcmhd-sink-test.c`, `ci/test-pcmhd-sink.sh`, `ci/test_check_elf.py` — test aggiunti.
+- `docs/agent-reports/verify-pcmhd-carrier.py` — verifica statica dei nuovi contratti.
+
+---
+
+## 7. Verifiche nella revisione correttiva
+
+Eseguite: solo controlli statici/leggeri documentati nel report dei fix (`git diff --check`, test
+Python del gate ELF, verifica statica del carrier quando il corpus locale è disponibile).
+
+Non eseguite: `cargo`, `make`, compilazione C, harness C, build ARM/IPK, deploy, TV, Docker, pull di
+dipendenze. I vecchi risultati Docker riportati nel commit `55d15b6b` riguardano il prototipo
+precedente e non provano questa revisione.

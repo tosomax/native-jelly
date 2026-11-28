@@ -323,6 +323,43 @@ impl Drop for NativeSessionStartGuard {
     }
 }
 
+/// Reset stale PCM-carrier state at every native start and roll it back on every error path,
+/// including no-audio/static branches and failures before either worker is created.
+struct PcmhdStartGuard {
+    committed: bool,
+    #[cfg(test)]
+    _test_lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl PcmhdStartGuard {
+    fn new() -> Self {
+        #[cfg(test)]
+        let test_lock = Some(crate::player::es_carrier::PCMHD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::player::es_carrier::set_pcmhd(false);
+        Self {
+            committed: false,
+            #[cfg(test)]
+            _test_lock: test_lock,
+        }
+    }
+
+    fn set(&self, on: bool) {
+        crate::player::es_carrier::set_pcmhd(on);
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PcmhdStartGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            crate::player::es_carrier::set_pcmhd(false);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeObjectDisposition {
     Destroy,
@@ -1173,16 +1210,33 @@ fn with_iec_pcm_info(p: &str, audio: &str) -> String {
 /// calculator maps `audio/x-raw` to the absent `"pcm"` key, so the audio list is empty — no ADEC.
 ///
 /// Applied AFTER [`with_iec_pcm_info`] has put the 48 kHz stereo node in, and only while the dev
-/// trigger is on: the two shapes differ in exactly these four fields, and a replacement that
-/// silently missed would leave a stereo-sized declaration over a 6x wider feed.
-fn with_pcmhd_info(p: &str) -> String {
-    let replaced = p.replacen(
-        r#""pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#,
-        r#""pcmInfo":{"format":"S16LE","channelMode":"8-channel","layout":"interleaved","sampleRate":192,"bitsPerSample":16}"#,
-        1,
-    );
-    debug_assert_ne!(replaced, p, "PCM carrier payload carries no stereo pcmInfo to widen");
-    replaced
+/// trigger is on. A missing, duplicate, malformed, or already-widened node is a hard refusal: a
+/// stereo declaration over a 6x wider feed is never an acceptable fallback.
+fn with_pcmhd_info(p: &str) -> Result<String, &'static str> {
+    const STEREO: &str = r#""pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#;
+    const WIDE: &str = r#""pcmInfo":{"format":"S16LE","channelMode":"8-channel","layout":"interleaved","sampleRate":192,"bitsPerSample":16}"#;
+    if p.matches(STEREO).count() != 1 || p.matches(WIDE).count() != 0 {
+        return Err("PCM carrier payload must contain exactly one stereo pcmInfo and no wide node");
+    }
+    let replaced = p.replacen(STEREO, WIDE, 1);
+    let value: serde_json::Value = serde_json::from_str(&replaced).map_err(|_| "PCM carrier payload is not valid JSON")?;
+    let contents = value
+        .get("args")
+        .and_then(|args| args.get(0))
+        .and_then(|arg| arg.get("option"))
+        .and_then(|option| option.get("externalStreamingInfo"))
+        .and_then(|streaming| streaming.get("contents"))
+        .ok_or("PCM carrier payload has no externalStreamingInfo.contents")?;
+    if contents.get("codec").and_then(|codec| codec.get("audio")).and_then(|audio| audio.as_str()) != Some("PCM") {
+        return Err("PCM carrier payload audio codec is not PCM");
+    }
+    if contents.get("pcmInfo") != Some(&serde_json::json!({
+        "format": "S16LE", "channelMode": "8-channel", "layout": "interleaved",
+        "sampleRate": 192, "bitsPerSample": 16
+    })) {
+        return Err("PCM carrier payload pcmInfo did not become the exact 192 kHz/8-channel shape");
+    }
+    Ok(replaced)
 }
 
 /// The `contents.immersive` node — **the Dolby Atmos half of the same envelope**, and the reason
@@ -1537,6 +1591,7 @@ fn start_bufferfeed_inner(
     pa: &mut super::adapter::PlayerAdapter,
     route_start: crate::route::RouteStartTransaction,
 ) -> Result<crate::route::RouteStartAttempt, crate::route::RouteStartResult> {
+    let pcmhd_start = PcmhdStartGuard::new();
     // A timed-out Load from an earlier Engine may still own the one native object the C seam
     // holds. Release it now if it has returned; otherwise refuse before anything below (the
     // exported window in particular) can touch state that object is still using.
@@ -1746,14 +1801,16 @@ fn start_bufferfeed_inner(
             // `docs/agent-reports/es-carrier-webos25.md` §4.3-5 is the evidence.
             let pcmhd = dts_iec
                 && crate::player::es_carrier::pcmhd_firmware()
-                && crate::player::es_carrier::pcmhd_requested();
-            crate::player::es_carrier::set_pcmhd(pcmhd);
+                && crate::player::es_carrier::pcmhd_requested()
+                && crate::route::stream_asample_rate(ps) == 48_000;
+            pcmhd_start.set(pcmhd);
             #[cfg(feature = "devtriggers")]
             {
                 if dts_iec && crate::player::es_carrier::pcmhd_requested() && !pcmhd {
                     log(&format!(
-                        "start_bufferfeed: PCM carrier NOT armed — webOS {} is not the measured 25",
-                        nj_platform::tv::device::info().major
+                        "start_bufferfeed: PCM carrier NOT armed — needs webOS 25, a receiver, and a known 48000 Hz DTS source (webOS {}, source rate {})",
+                        nj_platform::tv::device::info().major,
+                        crate::route::stream_asample_rate(ps)
                     ));
                 }
             }
@@ -1806,7 +1863,14 @@ fn start_bufferfeed_inner(
                 // The webOS 25 PCM carrier is the one declaration `build_av_payload` cannot
                 // express: `audio: PCM` plus the 192 kHz / 8-channel pcmInfo libpf parses with
                 // `sscanf("%2d-channel")` (`docs/agent-reports/es-carrier-webos25.md` §4.3).
-                with_pcmhd_info(&av)
+                match with_pcmhd_info(&av) {
+                    Ok(payload) => payload,
+                    Err(why) => {
+                        log(&format!("start_bufferfeed: PCM carrier payload refused — {why}"));
+                        SHARED.demux_failed.store(true, Ordering::Release);
+                        return Err(crate::route::RouteStartResult::StartFailed);
+                    }
+                }
             } else {
                 av
             };
@@ -2055,6 +2119,7 @@ fn start_bufferfeed_inner(
     log(&format!("seek mode: {mode:?} (layout_known={layout_known})"));
     super::set_seek_mode(mode);
     pa.install(eng);
+    pcmhd_start.commit();
     native_start.commit();
     clock_start.commit();
     TX.started.store(true, Ordering::Relaxed);
@@ -2082,7 +2147,7 @@ fn install_synthetic_playurl(
     ) {
         return Err(crate::route::RouteStartResult::StartFailed);
     }
-    if !crate::route::set_synthetic_audio_channels(ps, play.achannels, play.allow_wide_opus) {
+    if !crate::route::set_synthetic_audio_shape(ps, play.achannels, play.asample_rate, play.allow_wide_opus) {
         return Err(crate::route::RouteStartResult::StartFailed);
     }
     let url = play.url.clone();
@@ -4044,6 +4109,7 @@ mod payload_tests {
             vcodec: "hevc".into(),
             acodec: "eac3".into(),
             achannels: 0,
+            asample_rate: 0,
             allow_wide_opus: false,
             fps: 23.976,
             dovi: crate::player::playurl::PlayDovi {
@@ -6124,7 +6190,7 @@ mod sink_envelope_tests {
     fn pcmhd_declares_eight_channels_at_192k_and_no_stereo_node() {
         let ps = crate::route::PlaybackSession::IDLE;
         let stereo = build_av_payload(&ps, "H264", "PCM", ENVELOPE_FHD60);
-        let wide = with_pcmhd_info(&stereo);
+        let wide = with_pcmhd_info(&stereo).unwrap();
         let v: serde_json::Value = serde_json::from_str(&wide).unwrap();
         let contents = &v["args"][0]["option"]["externalStreamingInfo"]["contents"];
         assert_eq!(contents["codec"]["audio"], "PCM");
@@ -6133,6 +6199,32 @@ mod sink_envelope_tests {
             "sampleRate": 192, "bitsPerSample": 16
         }));
         assert!(!wide.contains(r#""channelMode":"stereo""#), "the stereo node must not survive");
+    }
+
+    #[test]
+    fn pcmhd_payload_refuses_missing_duplicate_malformed_or_already_wide_nodes() {
+        let ps = crate::route::PlaybackSession::IDLE;
+        let stereo = build_av_payload(&ps, "H264", "PCM", ENVELOPE_FHD60);
+        let node = r#""pcmInfo":{"format":"S16LE","channelMode":"stereo","layout":"interleaved","sampleRate":48,"bitsPerSample":16}"#;
+        assert!(with_pcmhd_info(&stereo.replace(node, "")).is_err(), "missing node");
+        assert!(with_pcmhd_info(&stereo.replace(node, &format!("{node},{node}"))).is_err(), "duplicate node");
+        assert!(with_pcmhd_info("{").is_err(), "malformed JSON");
+        assert!(with_pcmhd_info(&stereo.replace(node, &node.replace("stereo", "8-channel").replace("sampleRate\":48", "sampleRate\":192"))).is_err(), "already wide");
+    }
+
+    #[test]
+    fn pcmhd_start_guard_disarms_on_every_uncommitted_exit() {
+        let guard = PcmhdStartGuard::new();
+        assert!(!crate::player::es_carrier::pcmhd(), "a new start clears stale state");
+        guard.set(true);
+        assert!(crate::player::es_carrier::pcmhd());
+        drop(guard);
+        assert!(!crate::player::es_carrier::pcmhd(), "an error return rolls the arm back");
+        let guard = PcmhdStartGuard::new();
+        guard.set(true);
+        guard.commit();
+        assert!(crate::player::es_carrier::pcmhd(), "a successfully installed session keeps the arm");
+        crate::player::es_carrier::set_pcmhd(false);
     }
 
     #[test]

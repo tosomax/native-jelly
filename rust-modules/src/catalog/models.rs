@@ -621,6 +621,10 @@ pub struct Stream {
     pub chroma_subsampling: String,
     #[serde(default, deserialize_with = "de_i64")]
     pub channels: i64,
+    /// Audio stream only: source sample rate in Hz. Zero means the server did not say.
+    /// The diagnostic PCM carrier fails closed unless this is exactly 48000.
+    #[serde(rename = "sampleRate", default, deserialize_with = "de_i64")]
+    pub sample_rate: i64,
     #[serde(rename = "audioChannelLayout", default)]
     pub audio_channel_layout: String,
     #[serde(rename = "displayTitle", default)]

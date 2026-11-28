@@ -358,6 +358,7 @@ jobs:
         run: ./ci/check-elf.sh
         env:
           WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+          PCMHD_HOOK: "1"
 
       - name: Packaging assertions
         # After the build above, so a missing package is a failure rather than a skip.

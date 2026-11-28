@@ -20,6 +20,7 @@ fn from_stream_eac3_joc_is_immersive() {
         id: 7,
         codec: "eac3".into(),
         channels: 6,
+        sample_rate: 48_000,
         profile: "dolby digital plus + dolby atmos".into(),
         can_normalize_loudness: true,
         ..Default::default()
@@ -29,6 +30,7 @@ fn from_stream_eac3_joc_is_immersive() {
     assert_eq!(carried.ordinal, 2);
     assert_eq!(carried.codec, "eac3");
     assert_eq!(carried.channels, 6);
+    assert_eq!(carried.sample_rate, 48_000);
     assert!(carried.can_normalize_loudness);
     assert!(carried.immersive, "a JOC profile must read as immersive");
 }
@@ -75,6 +77,7 @@ fn none_round_trips_publication_projection_pending() {
         ordinal: 0,
         codec: "aac".into(),
         channels: 2,
+        sample_rate: 0,
         can_normalize_loudness: false,
         immersive: false,
     });
@@ -178,4 +181,18 @@ fn opus_load_channels_follow_the_exact_carried_track() {
     ps.stream_acodec = "opus".into();
     ps.cur_audio = Some(CarriedAudio::named(7, -1));
     assert_eq!(stream_achannels(&ps), 0, "a named track has no layout evidence");
+    assert_eq!(stream_asample_rate(&ps), 0, "a named track has no rate evidence");
+}
+
+#[test]
+fn sample_rate_follows_only_the_matching_carried_track() {
+    let mut ps = PlaybackSession::IDLE;
+    ps.stream_acodec = "dts".into();
+    assert_eq!(stream_asample_rate(&ps), 0, "unknown track fails closed");
+    ps.cur_audio = Some(CarriedAudio::from_stream(&crate::metadata::Stream {
+        codec: "DTS".into(), channels: 6, sample_rate: 44_100, ..Default::default()
+    }, 0));
+    assert_eq!(stream_asample_rate(&ps), 44_100);
+    ps.stream_acodec = "aac".into();
+    assert_eq!(stream_asample_rate(&ps), 0, "a converted route cannot borrow the source rate");
 }

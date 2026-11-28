@@ -2,6 +2,11 @@
 
 Data: 28/11/2026. Analisi statica, sola lettura. Nessun file o binario modificato, nessuna TV usata.
 
+> **Nota di implementazione (28/11/2026):** la proposta §5.3 è storica. Il prototipo corretto in
+> `src/pcmhd_sink.c` usa API pubbliche GStreamer/GObject, non legge più offset delle strutture e
+> richiede un handshake CAPS accettate prima del feed. Vedere `pcmhd-carrier.md` e
+> `pcmhd-carrier-review-fixes.md`.
+
 Etichette:
 
 - **PROVA**: letto nel disassemblaggio, nel DWARF o nel sorgente citato.
@@ -256,11 +261,14 @@ Un file C accanto a `src/es_swap.c` (es. `src/es_sink.c`), esportato dall'esegui
 
 1. Intercetta `gst_element_factory_make` (o `gst_element_factory_create`).
 2. Chiama la funzione reale via `dlsym(RTLD_NEXT, ...)`.
+   **Revisione:** l'implementazione corrente risolve separatamente il real `make` e i simboli della
+   probe; il fast path disarmato non risolve questi ultimi.
 3. Se il factory name è `"audiosink"`:
-   - ottiene il pad `"sink"` con `gst_element_get_static_pad`;
+   - ottiene il pad `"sink"` con `gst_element_get_static_pad` (transfer-full, senza ref aggiuntivo);
    - installa un probe `GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM` (e `EVENT_FLUSH` per il seek);
    - nel probe, se `nj_es_armed`:
-     - sostituisce l'evento CAPS con le caps carrier:
+     - usa `gst_pad_probe_info_get_event`/`gst_event_get_type` (API pubbliche) e sostituisce l'evento
+     CAPS con le caps carrier solo se il downstream accetta; altrimenti preserva l'originale:
        ```
        audio/x-raw, format=(string)S16LE, layout=(string)interleaved,
        rate=(int)192000, channels=(int)8, channel-mask=(bitmask)0xc3f,
@@ -286,7 +294,7 @@ Punti di forza: nessun buffer swap nel caso 5.2 (il feed è già carrier), nessu
 ## 6. Rischi ABI e di piattaforma
 
 1. **Interposizione GStreamer**: l'eseguibile deve esportare `gst_element_factory_make` (o `_create`). Se libpf risolve i simboli con `BIND_NOW`/visibilità protetta, l'interposizione non avviene. Va verificato sul device con `LD_DEBUG=bindings` o con un log nel wrapper.
-2. **Offset del flag**: `GstMiniObject.flags` a offset 12 è provato dal DWARF del sink donor e dall'istruzione `[buf+0xc]`. Con header GStreamer si usa `GST_BUFFER_FLAG_SET`; senza header, un `uint32_t` a offset 12 è ABI-dipendente. Aggiungere un guard a compile time (`sizeof(void*) == 4`, GStreamer 1.24) e, se possibile, un check runtime della versione.
+2. **Offset del flag**: `GstMiniObject.flags` a offset 12 è provato dal DWARF del sink donor e dall'istruzione `[buf+0xc]`. La variante PCM carrier non imposta questo flag. L'hook corretto non legge né flags né offset di evento/probe: usa API pubbliche per le caps. Un'eventuale variante native ES richiederebbe header GStreamer o un guard ABI/runtime separato.
 3. **Build del sink**: il donor-G5 non è necessariamente il file della TV. dts_restore_plus ha una allowlist di sink verificati (`w25_pt_sink_verified`); la G5 compare, ma con firmware 33.30.97. La nostra TV è 33.31.68: verificare SHA-256 del `libgstlgaudiosink.so` prima di armare. Un sink non previsto può dare rumore o silenzio.
 4. **Caps extra**: il template del sink accetta `audio/x-raw`; i campi `es`, `clock-x4`, `codec-str`, `data-*` sono extra. dts_restore_plus lo prova sul suo sink; non è detto che ogni build li interpreti allo stesso modo.
 5. **`codec-str`**: l'enum del sink non ha DTS; `"mat"` è il valore usato da dts_restore_plus. Non inventare `"dts"`/`"dtshd"`: non sono nella tabella.

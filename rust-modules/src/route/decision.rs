@@ -4576,20 +4576,30 @@ pub(crate) fn stream_achannels(ps: &PlaybackSession) -> i64 {
             == nj_platform::devcaps::audio_codec_id(&ps.stream_acodec)
     }).map_or(0, |track| track.channels)
 }
+/// Source sample rate of the exact carried track, only when its codec agrees with the Load.
+/// Unknown (`0`) is deliberately not guessed: the diagnostic PCM carrier refuses it.
+pub(crate) fn stream_asample_rate(ps: &PlaybackSession) -> i64 {
+    ps.cur_audio.as_ref().filter(|track| {
+        nj_platform::devcaps::audio_codec_id(&track.codec)
+            == nj_platform::devcaps::audio_codec_id(&ps.stream_acodec)
+    }).map_or(0, |track| track.sample_rate)
+}
 /// An explicit pipeline fixture has no server-selected track. Its declaration
 /// is validated against the probed staged decoder policy and again against the
 /// actual container before feed. It never changes shipping route capabilities.
-pub(crate) fn set_synthetic_audio_channels(ps: &mut PlaybackSession, channels: i64, allow_wide: bool) -> bool {
+pub(crate) fn set_synthetic_audio_shape(ps: &mut PlaybackSession, channels: i64, sample_rate: i64, allow_wide: bool) -> bool {
     ps.cur_audio = None;
-    if nj_platform::devcaps::audio_codec_id(&ps.stream_acodec) != "opus" {
+    let is_opus = nj_platform::devcaps::audio_codec_id(&ps.stream_acodec) == "opus";
+    if is_opus {
+        if !attempt_caps(ps).opus_fixture_supports(channels, allow_wide) {
+            crate::player::log("playurl: Opus decoder/layout not admitted by measured firmware policy");
+            return false;
+        }
+    } else if sample_rate == 0 {
         return true;
     }
-    if !attempt_caps(ps).opus_fixture_supports(channels, allow_wide) {
-        crate::player::log("playurl: Opus decoder/layout not admitted by measured firmware policy");
-        return false;
-    }
     ps.cur_audio = Some(CarriedAudio::from_stream(&crate::metadata::Stream {
-        codec: "opus".into(), channels, ..Default::default()
+        codec: ps.stream_acodec.clone(), channels, sample_rate, ..Default::default()
     }, 0));
     true
 }
@@ -8757,6 +8767,7 @@ pub(crate) fn enhancement_test_session(route: EnhTestFixture) -> (PlaybackSessio
         ordinal: 1,
         codec: "ac3".into(),
         channels: 2,
+        sample_rate: 0,
         can_normalize_loudness: capable,
         immersive: false,
     });

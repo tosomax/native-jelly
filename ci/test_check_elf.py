@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -81,7 +82,7 @@ class ElfGateTests(unittest.TestCase):
         env.update({"READELF": str(self.root / "tools/readelf"),
                     "OBJDUMP": str(self.root / "tools/objdump"),
                     "PATH": str(self.root / "tools") + os.pathsep + env.get("PATH", ""),
-                    "TMPDIR": str(self.root / "scratch"), "CI": "true",
+                    "TMPDIR": str(self.root / "scratch"), "CI": "true", "PCMHD_HOOK": "0",
                     "ELF_TEST_SPEC": str(self.spec)})
         env.update(extra_env or {})
         return subprocess.run(["bash", str(self.script), "synthetic.elf"], cwd=self.root,
@@ -184,6 +185,29 @@ class ElfGateTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("ioctl hook", result.stdout)
 
+    def test_the_pcm_carrier_hook_is_feature_aware(self):
+        symbol = "3: 00000020 64 FUNC GLOBAL DEFAULT 1 gst_element_factory_make\n"
+        spec = defaults()
+        spec["readelf:--dyn-syms"]["output"] += symbol
+        result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("devtriggers: gst_element_factory_make hook exported", result.stdout)
+
+        result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "0"})
+        self.assertNotEqual(result.returncode, 0, "a release artifact must not carry the hook")
+        self.assertIn("non-devtriggers build must not define/import", result.stdout)
+
+        spec = defaults()
+        result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
+        self.assertNotEqual(result.returncode, 0, "a devtriggers artifact must export the hook")
+        self.assertIn("not present exactly once", result.stdout)
+
+        spec = defaults()
+        spec["readelf:--dyn-syms"]["output"] += "3: 00000020 64 FUNC GLOBAL DEFAULT UND gst_element_factory_make\n"
+        result = self.run_gate(spec, extra_env={"PCMHD_HOOK": "1"})
+        self.assertNotEqual(result.returncode, 0, "an import is not an interposer")
+        self.assertIn("defined GLOBAL/DEFAULT", result.stdout)
+
     def test_early_forbidden_relocation_with_large_tail(self):
         spec = defaults()
         spec["readelf:-rW"]["output"] = LOAD + "\n" + FILLER
@@ -238,6 +262,47 @@ class ElfGateTests(unittest.TestCase):
             self.assertEqual(len(seen), 2, "each invocation must reserve private scratch")
             self.assertEqual(len(set(seen)), 2)
         self.assertEqual(list((self.root / "scratch").iterdir()), [])
+
+
+class PcmhdSourceContractTests(unittest.TestCase):
+    def test_c_hook_uses_public_event_abi_and_balanced_pad_ownership(self):
+        hook = (ROOT / "src/pcmhd_sink.c").read_text()
+        self.assertIn("gst_pad_probe_info_get_event", hook)
+        self.assertIn("gst_event_get_type", hook)
+        self.assertIn("gst_event_type_get_name", hook)
+        self.assertIn("g_type_instance_get_class", hook)
+        self.assertNotIn("PCMHD_EVENT_TYPE_OFFSET", hook)
+        self.assertNotIn("PCMHD_PROBE_INFO_DATA_OFFSET", hook)
+        self.assertIn("typedef void (*remove_probe_fn)(GstPad *, unsigned long);", hook)
+        self.assertNotIn("s.object_ref(pad)", hook)
+        self.assertIn("void nj_pcmhd_disarm(void)", hook)
+        self.assertIn("#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif", hook)
+
+    def test_c_sources_do_not_redefine_makefile_compiler_macros(self):
+        make_lines = [line for line in (ROOT / "Makefile").read_text().splitlines()
+                      if not line.lstrip().startswith("#")]
+        passed = set(re.findall(r"(?<![A-Za-z0-9_])-D([A-Za-z_][A-Za-z0-9_]*)", "\n".join(make_lines)))
+        sources = list((ROOT / "src").glob("*.c")) + list((ROOT / "ci").glob("*.c"))
+        for path in sources:
+            source = path.read_text()
+            for macro in passed:
+                local = re.search(rf"^#define {re.escape(macro)}\b", source, re.M)
+                if local:
+                    guarded = macro == "_GNU_SOURCE" and "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif" in source
+                    self.assertTrue(guarded, f"{path.relative_to(ROOT)} redefines Makefile macro {macro}")
+
+    def test_build_and_demux_fail_closed_without_accepted_caps_or_supported_timing(self):
+        makefile = (ROOT / "Makefile").read_text()
+        self.assertIn("PCMHD_HOOK ?=", makefile)
+        self.assertIn("src/pcmhd_sink.c,$(wildcard src/*.c)", makefile)
+        self.assertIn("$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)", makefile)
+        carrier = (ROOT / "rust-modules/src/player/es_carrier.rs").read_text()
+        feed = (ROOT / "rust-modules/src/ff.rs").read_text()
+        self.assertIn("timing.supported()", carrier)
+        self.assertIn("pub(crate) fn finish", carrier)
+        self.assertIn("pcmhd_wait_ready()", feed)
+        self.assertIn("dts_core_timing(&core)", feed)
+        self.assertIn("rate != 48_000", feed)
 
 
 class MakeCheckContractTests(unittest.TestCase):

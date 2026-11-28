@@ -483,6 +483,10 @@ endif
 CARGO_SEED = $(if $(filter yes,$(NJ_LINKED_WORKTREE)),python3 tools/cargo-seed.py,true)
 
 RUST_FEATFLAGS = $(if $(RELEASE),--no-default-features,)$(if $(LAB), --features lab-diagnostics,)
+# The C audiosink interposer exists only where the Rust trigger exists. Default features include
+# devtriggers; RELEASE (or an explicit --no-default-features) omits it unless named back explicitly.
+PCMHD_HOOK ?= $(if $(findstring --no-default-features,$(RUST_FEATFLAGS)),$(if $(findstring devtriggers,$(RUST_FEATFLAGS)),1,),1)
+PCMHD_SRC   = $(if $(filter 1,$(PCMHD_HOOK)),src/pcmhd_sink.c)
 RUST_TDIR      = target$(if $(RELEASE),-release,)$(if $(LAB),-lab,)$(if $(SYMBOLS),-sym,)
 # OVERRIDING RUST_FEATFLAGS BY HAND? PASS RUST_TDIR TOO. This dir is keyed on RELEASE, not on the
 # flag set, so `make RUST_FEATFLAGS=...` alone lands in the SAME target/ as an ordinary build:
@@ -708,8 +712,9 @@ RUST_TARGET = arm-unknown-linux-gnueabi
 RUST_LIB    = rust-modules/$(RUST_TDIR)/$(RUST_TARGET)/release/libnativejelly_modules.a
 
 # Every ordinary C translation unit ships; gpdebug remains an opt-in allocator guard.
-# ass.c belongs to the privately bundled renderer, never the application ELF.
-SRCS = $(filter-out src/gpdebug.c src/ass.c,$(wildcard src/*.c)) src/compat/getauxval.c
+# ass.c belongs to the privately bundled renderer, never the application ELF. The PCM-carrier
+# interposer is diagnostic-only and is absent unless devtriggers is in the actual Rust feature set.
+SRCS = $(filter-out src/gpdebug.c src/ass.c src/pcmhd_sink.c,$(wildcard src/*.c)) $(PCMHD_SRC) src/compat/getauxval.c
 OBJS = $(SRCS:.c=.o)
 
 all: pkg/nativejelly pkg/nativejelly-storage
@@ -896,9 +901,9 @@ SMP_INTERPOSER_LDFLAG = -Wl,--export-dynamic-symbol=$(SMP_CALLBACK_HOOK)
 # rust-modules/src/player/es_carrier.rs (lossless audio to a receiver).
 SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=ioctl
 # src/pcmhd_sink.c exports gst_element_factory_make so libpf's `audiosink` creation reaches the
-# webOS 25 PCM-carrier caps hook in the same module. Dev trigger only: with no trigger armed the
-# wrapper is a plain forward and never resolves a GStreamer symbol.
-SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make
+# webOS 25 PCM-carrier caps hook. Both the object and export are omitted without devtriggers; with
+# the trigger off at runtime the wrapper resolves only the real factory and forwards it unchanged.
+SMP_INTERPOSER_LDFLAG += $(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)
 # --gc-sections: this link is gcc's, not rustc's. rustc passes --gc-sections itself when IT links an
 # executable (which is why pkg/nativejelly-storage above never needed the flag), but here the Rust
 # code arrives as a finished staticlib, so without the flag every section of every archive member
@@ -914,8 +919,8 @@ SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make
 # executable, whose .dynsym defines only _init, _fini and the interposer). Nothing here uses
 # `#[used]`/`link_section`/`__attribute__((constructor))`. If a future feature needs a symbol that
 # only `dlsym(RTLD_DEFAULT, ...)` reaches inside this binary, it must be exported or KEEP()ed
-# explicitly. `ci/check-elf.sh` only asserts that the Starfish interposer is exported (and that
-# Load-with-context is not a loader dependency); it does not assert that nothing else is defined.
+# explicitly. `ci/check-elf.sh` asserts the Starfish interposer and makes the PCM-carrier export
+# conditional on PCMHD_HOOK; it does not assert that nothing else is defined.
 GC_SECTIONS_LDFLAG = -Wl,--gc-sections
 pkg/nativejelly: $(OBJS) $(RUST_LIB) $(FFMPEG_STAGED) $(LIBASS_STAGED) $(SENTRY_NATIVE_STAMP) Makefile ci/arm-cc.py ci/check-link-evidence.py
 	$(CC) $(CFLAGS) -Wl,--build-id=sha1 $(GC_SECTIONS_LDFLAG) $(SMP_INTERPOSER_LDFLAG) \

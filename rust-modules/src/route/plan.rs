@@ -146,6 +146,9 @@ pub(crate) struct CarriedAudio {
     pub(crate) ordinal: i32,
     pub(crate) codec: String,
     pub(crate) channels: i64,
+    /// Source sample rate in Hz, `0` when the route did not read a concrete track. The PCM
+    /// carrier requires 48000 and treats every other value (including unknown) as a refusal.
+    pub(crate) sample_rate: i64,
     /// PMS 1.43.4+ Plex Pass: can the server honor `boostDialog`/`normalizeLoudness` for this
     /// track (issue #266; wire field is `plex::Stream::can_normalize_loudness`).
     pub(crate) can_normalize_loudness: bool,
@@ -166,6 +169,7 @@ impl CarriedAudio {
             // payload disagree with the direct play it restores.
             codec: s.codec.to_lowercase(),
             channels: s.channels,
+            sample_rate: s.sample_rate,
             can_normalize_loudness: s.can_normalize_loudness,
             immersive: s.has_atmos(),
         }
@@ -182,6 +186,7 @@ impl CarriedAudio {
             ordinal,
             codec: String::new(),
             channels: 0,
+            sample_rate: 0,
             can_normalize_loudness: false,
             immersive: false,
         }

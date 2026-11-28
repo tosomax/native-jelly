@@ -2577,6 +2577,7 @@ mod tests {
                     ordinal: 1,
                     codec: "eac3".into(),
                     channels: 8,
+                    sample_rate: 0,
                     can_normalize_loudness: true,
                     immersive: true,
                 }),

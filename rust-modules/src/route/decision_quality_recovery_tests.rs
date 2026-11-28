@@ -667,7 +667,7 @@ fn failed_original_then_auto_keeps_the_live_adaptive_route() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -762,7 +762,7 @@ fn hls_recovery_restores_the_exact_direct_source_and_rearms_its_watchdog() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: Some(2),
             }),
             ..Default::default()
@@ -838,7 +838,7 @@ fn a_recovery_that_never_opens_can_still_go_back_to_the_encoder_it_replaced() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: Some(2),
             }),
             ..Default::default()
@@ -955,7 +955,7 @@ fn a_missing_whole_file_bitrate_must_not_silently_delete_original_recovery() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1010,7 +1010,7 @@ fn a_recovery_that_opens_spends_the_way_back_rather_than_leaving_it_armed() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1156,7 +1156,7 @@ fn a_quality_change_waits_for_an_original_handoff_to_commit() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1238,7 +1238,7 @@ fn a_quality_change_survives_an_original_handoff_rollback() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 0, ordinal: -1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 0, ordinal: -1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1370,7 +1370,7 @@ fn audio_selected_during_original_trial_uses_the_route_that_actually_lands() {
                 fps: 23.976,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1382,7 +1382,7 @@ fn audio_selected_during_original_trial_uses_the_route_that_actually_lands() {
         Some(AutoOriginalReload::Direct)
     );
 
-    commit_audio_selection(&mut ps, CarriedAudio { sid: 99, ordinal: 2, codec: "aac".into(), channels: 2, can_normalize_loudness: false, immersive: false });
+    commit_audio_selection(&mut ps, CarriedAudio { sid: 99, ordinal: 2, codec: "aac".into(), channels: 2, sample_rate: 0, can_normalize_loudness: false, immersive: false });
     assert!(
         !pending_user_route_intent(UserRouteIntent::NativeAudioReload),
         "the temporary Direct actuator must not escape the Original trial",
@@ -1487,7 +1487,7 @@ fn automatic_recovery_issues_no_part_admission_before_the_trial() {
                 fps: 24.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 0, ordinal: -1, codec: "aac".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 0, ordinal: -1, codec: "aac".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1543,7 +1543,7 @@ fn direct_recovery_without_its_server_keeps_hls_instead_of_using_a_logical_alias
                 fps: 24.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 0, ordinal: -1, codec: "aac".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 0, ordinal: -1, codec: "aac".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1594,7 +1594,7 @@ fn manually_picking_original_restores_native_dolby_vision_instead_of_retranscodi
                         true,
                     ),
                 },
-                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 1, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1682,7 +1682,7 @@ fn local_auto_preserves_the_candidate_needed_to_leave_a_fixed_rung() {
                 fps: 25.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 14_778, ordinal: 0, codec: "aac".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 14_778, ordinal: 0, codec: "aac".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1789,7 +1789,7 @@ fn manual_original_after_a_fixed_rung_returns_to_the_native_source() {
                 fps: 25.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 14_778, ordinal: 0, codec: "aac".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 14_778, ordinal: 0, codec: "aac".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1896,7 +1896,7 @@ fn original_to_auto_restarts_the_worker_to_arm_the_watchdog() {
                 fps: 24.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 0, codec: "eac3".into(), channels: 0, can_normalize_loudness: false, immersive: true }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 0, codec: "eac3".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: true }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -1974,7 +1974,7 @@ fn auto_to_an_admitting_fixed_rung_restarts_the_worker_to_remove_the_watchdog() 
                 fps: 24.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 42, ordinal: 0, codec: "aac".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 42, ordinal: 0, codec: "aac".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: None,
             }),
             ..Default::default()
@@ -2032,7 +2032,7 @@ fn manual_original_after_a_fixed_rung_with_a_subtitle_returns_to_direct_play() {
                 fps: 25.0,
                 dovi: crate::metadata::Dovi::NONE,
                 dv_decision: crate::metadata::DvDecision::NONE,
-                audio: Some(CarriedAudio { sid: 14_778, ordinal: 0, codec: "aac".into(), channels: 0, can_normalize_loudness: false, immersive: false }),
+                audio: Some(CarriedAudio { sid: 14_778, ordinal: 0, codec: "aac".into(), channels: 0, sample_rate: 0, can_normalize_loudness: false, immersive: false }),
                 subtitle_ordinal: Some(3),
             }),
             ..Default::default()

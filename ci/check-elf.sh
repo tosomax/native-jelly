@@ -77,15 +77,27 @@ awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" { ok=1 } END { exit !ok }
 ok "ioctl hook exported GLOBAL/DEFAULT"
 
 echo "== webOS 25 PCM-carrier sink hook =="
-# src/pcmhd_sink.c defines gst_element_factory_make so libpf's audiosink creation reaches the
-# caps hook (dev trigger only). Same loader rule as the two above: without the export the library's
-# PLT slot keeps its own definition and the hook is dead code that logs nothing.
-PCMHD_ROWS=$(awk '$NF == "gst_element_factory_make" && $7 != "UND" { print }' <<<"$DYN_SYMS")
-[ "$(wc -l <<<"$PCMHD_ROWS" | tr -d ' ')" -eq 1 ] && [ -n "$PCMHD_ROWS" ] \
-  || fail "gst_element_factory_make hook is not defined exactly once in .dynsym"
-awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" { ok=1 } END { exit !ok }' <<<"$PCMHD_ROWS" \
-  || fail "gst_element_factory_make hook is not a GLOBAL/DEFAULT .dynsym function"
-ok "gst_element_factory_make hook exported GLOBAL/DEFAULT"
+# src/pcmhd_sink.c is compiled/exported only when the Rust devtriggers feature is present. A
+# release/no-default-features artifact must contain no such interposer at all; a diagnostic
+# artifact must export it exactly once. This checks the export, not the target callsite — the
+# runtime CAPS handshake in es_carrier/ff.rs fails closed if libpf never reaches the wrapper.
+PCMHD_HOOK="${PCMHD_HOOK:-0}"
+case "$PCMHD_HOOK" in
+  0|1) ;;
+  *) fail "PCMHD_HOOK must be 0 or 1, got '$PCMHD_HOOK'" ;;
+esac
+PCMHD_ROWS=$(awk '$NF == "gst_element_factory_make" { print }' <<<"$DYN_SYMS")
+if [ "$PCMHD_HOOK" = 1 ]; then
+  [ "$(wc -l <<<"$PCMHD_ROWS" | tr -d ' ')" -eq 1 ] && [ -n "$PCMHD_ROWS" ] \
+    || fail "devtriggers build: gst_element_factory_make hook is not present exactly once in .dynsym"
+  awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { ok=1 } END { exit !ok }' <<<"$PCMHD_ROWS" \
+    || fail "gst_element_factory_make hook is not a defined GLOBAL/DEFAULT .dynsym function"
+  ok "devtriggers: gst_element_factory_make hook exported GLOBAL/DEFAULT"
+else
+  [ -z "$PCMHD_ROWS" ] \
+    || fail "non-devtriggers build must not define/import gst_element_factory_make"
+  ok "non-devtriggers: PCM-carrier interposer absent"
+fi
 
 echo "== crash-report identity =="
 # Two facts a Sentry crash report is built out of, and BOTH fail silently when wrong: a frame comes

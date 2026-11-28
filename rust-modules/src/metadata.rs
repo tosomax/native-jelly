@@ -781,6 +781,10 @@ pub(crate) struct Stream {
     pub(crate) language_tag: String,
     pub(crate) codec: String,
     pub(crate) channels: i64,
+    /// Audio stream only: source sample rate in Hz, `0` when PMS did not say. Kept in the
+    /// recorded `Detail` round trip, but omitted when unknown so older recordings still validate.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub(crate) sample_rate: i64,
     pub(crate) layout: String, // audioChannelLayout, e.g. "5.1(side)"
     /// Per-STREAM bitrate in kbps (0 = the server did not say) — NOT the file's. It is what tells
     /// seven same-language AC3 tracks apart in `screens::tracks_panel`, where language and codec alone
@@ -828,6 +832,10 @@ pub(crate) struct Stream {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 impl Stream {
@@ -2320,6 +2328,7 @@ fn convert_streams(streams: &[crate::catalog::Stream]) -> Streams {
             language_tag: s.language_tag.clone(),
             codec: s.codec.clone(),
             channels: s.channels,
+            sample_rate: s.sample_rate,
             layout: s.audio_channel_layout.clone(),
             bitrate: s.bitrate,
             profile: s.profile.clone(),

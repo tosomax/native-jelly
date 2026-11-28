@@ -24,12 +24,13 @@
 //! `/tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd` for the debug app):
 //! the Load declares `PCM` S16LE 192 kHz 8 ch, the demuxer FEEDS the same three-burst 98304-byte
 //! chunks every 32 ms as raw PCM, and `src/pcmhd_sink.c` rewrites the caps event on the `audiosink`
-//! so the sink treats those bytes as an IEC 61937 bitstream. Nothing here is enabled by default and
-//! nothing claims the end-to-end path is proven: `docs/agent-reports/pcmhd-carrier.md` records the
-//! exact ABI evidence and the unproven steps.
+//! so the sink treats those bytes as an IEC 61937 bitstream. Only a known 48 kHz source whose core
+//! header proves 512-sample frames is admitted, and no chunk is fed until the C probe reports
+//! accepted carrier CAPS. Nothing here is enabled by default and nothing claims the end-to-end path
+//! is proven: `docs/agent-reports/pcmhd-carrier.md` records the evidence and unproven steps.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// LG's DD+ burst on the 192 kHz stereo carrier: 1536 samples x 4 (rate) x 4 bytes.
@@ -59,11 +60,59 @@ pub static nj_es_armed: std::sync::atomic::AtomicI32 = std::sync::atomic::Atomic
 /// The webOS 25 PCM carrier (dev trigger, `src/pcmhd_sink.c`): true for the playback whose Load
 /// declares PCM 192 kHz 8 ch and whose demuxer feeds the carrier chunks as raw PCM.
 static PCMHD: AtomicBool = AtomicBool::new(false);
-/// What `src/pcmhd_sink.c` reads before it looks at a caps event: non-zero only while [`PCMHD`],
-/// so with the mode off the exported `gst_element_factory_make` is a plain forward.
+/// The C probe has accepted carrier CAPS for this exact arming generation. The demuxer waits for
+/// this before its first carrier write; an export/callsite that never interposes cannot feed noise.
+static PCMHD_SINK_READY: AtomicBool = AtomicBool::new(false);
+/// The C probe refused setup, saw an unexpected shape, or had its replacement CAPS rejected.
+static PCMHD_SINK_REFUSED: AtomicBool = AtomicBool::new(false);
+/// Invalidates callbacks from a previous playback when a new start arms or disarms the mode.
+static PCMHD_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static PCMHD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(all(
+    feature = "devtriggers",
+    not(any(test, feature = "hostsim")),
+    target_arch = "arm",
+    target_os = "linux"
+))]
+extern "C" {
+    fn nj_pcmhd_disarm();
+}
+
+/// C reads the arm flag through a Rust atomic rather than sharing a Rust static's C type.
 #[no_mangle]
-#[allow(non_upper_case_globals)]
-pub static nj_pcmhd_armed: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+pub extern "C" fn nj_pcmhd_armed_load() -> i32 {
+    i32::from(PCMHD.load(Ordering::Acquire))
+}
+
+#[no_mangle]
+pub extern "C" fn nj_pcmhd_armed_store(value: i32) {
+    PCMHD.store(value != 0, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn nj_pcmhd_session_load() -> u64 {
+    PCMHD_GENERATION.load(Ordering::Acquire)
+}
+
+#[no_mangle]
+pub extern "C" fn nj_pcmhd_sink_ready(session: u64) {
+    if session == PCMHD_GENERATION.load(Ordering::Acquire) && PCMHD.load(Ordering::Acquire) {
+        PCMHD_SINK_READY.store(true, Ordering::Release);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn nj_pcmhd_sink_refused(session: u64) {
+    if session == PCMHD_GENERATION.load(Ordering::Acquire) && PCMHD.load(Ordering::Acquire) {
+        PCMHD_SINK_REFUSED.store(true, Ordering::Release);
+        // Do not call back into C's remove_probe from inside its own callback. The next start or
+        // teardown removes the probe; the demuxer sees this flag before writing any carrier bytes.
+        PCMHD.store(false, Ordering::Release);
+        nj_pcmhd_armed_store(0);
+    }
+}
 /// Bursts and writes are HBR-sized (x [`HBR`]).
 static WIDE: AtomicBool = AtomicBool::new(false);
 /// `/dev/earc_route`, open while HBR is on: writing "2" leases eARC to renderer index 1 (LG's main
@@ -141,14 +190,50 @@ pub(crate) fn pcmhd() -> bool {
     PCMHD.load(Ordering::Acquire)
 }
 
-/// Arm or disarm the PCM carrier. Both the Rust demuxer ([`pcmhd`]) and `src/pcmhd_sink.c`
-/// ([`nj_pcmhd_armed`]) read it, and it is set BEFORE the Load that creates the `audiosink`, on the
-/// main thread. Independent of [`ON`]: this mode never touches the C1 ES-renderer path.
+/// Arm or disarm the PCM carrier. Both the Rust demuxer ([`pcmhd`]) and `src/pcmhd_sink.c` read
+/// it through C accessors, and it is set BEFORE the Load that creates the `audiosink`, on the main
+/// thread. Independent of [`ON`]: this mode never touches the C1 ES-renderer path.
 pub(crate) fn set_pcmhd(on: bool) {
-    PCMHD.store(on, Ordering::Release);
-    nj_pcmhd_armed.store(i32::from(on), Ordering::Release);
+    // The target link includes the C hook only with devtriggers. Host tests/simulator builds do
+    // not link that object; their C behaviour is covered by ci/pcmhd-sink-test.c instead.
+    #[cfg(all(
+        feature = "devtriggers",
+        not(any(test, feature = "hostsim")),
+        target_arch = "arm",
+        target_os = "linux"
+    ))]
+    unsafe {
+        nj_pcmhd_disarm();
+    }
+    PCMHD_GENERATION.fetch_add(1, Ordering::AcqRel);
+    PCMHD_SINK_READY.store(false, Ordering::Release);
+    PCMHD_SINK_REFUSED.store(false, Ordering::Release);
+    nj_pcmhd_armed_store(i32::from(on));
     if on {
-        crate::player::log("es_carrier: PCM carrier armed (PCM S16LE 192 kHz 8 ch, IEC 61937 chunks as raw PCM)");
+        crate::player::log("es_carrier: PCM carrier armed (PCM S16LE 192 kHz 8 ch, waiting for accepted sink CAPS)");
+    }
+}
+
+/// Wait for the C probe to accept carrier CAPS before the demuxer writes its first chunk. A
+/// missing interposition, a rejected CAPS event, or a sink that never negotiates all fail closed.
+pub(crate) fn pcmhd_wait_ready() -> bool {
+    pcmhd_wait_ready_for(std::time::Duration::from_secs(10))
+}
+
+fn pcmhd_wait_ready_for(timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if !PCMHD.load(Ordering::Acquire) || PCMHD_SINK_REFUSED.load(Ordering::Acquire) {
+            return false;
+        }
+        if PCMHD_SINK_READY.load(Ordering::Acquire) {
+            return true;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+        std::thread::sleep((timeout - elapsed).min(std::time::Duration::from_millis(10)));
     }
 }
 
@@ -402,12 +487,36 @@ fn dtshd_burst(frame: &[u8], core_len: usize, wide: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Timing read from a normalized DTS core header. The PCM carrier supports exactly 512 samples
+/// at 48 kHz: three packets are 1536 samples = 32 ms. Every other shape is refused, not retimed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DtsTiming {
+    pub(crate) sample_rate: u32,
+    pub(crate) blocks: u16,
+}
+
+impl DtsTiming {
+    pub(crate) const SUPPORTED: Self = Self { sample_rate: 48_000, blocks: 16 };
+
+    pub(crate) fn supported(self) -> bool {
+        self == Self::SUPPORTED
+    }
+}
+
 /// Groups DTS-HD frames three at a time into one queued chunk; the demuxer feeds a silent E-AC-3
 /// frame with the first frame's timestamp whenever [`Packer::frame`] answers `Some`.
 /// One carrier frame: 1536 samples at 48 kHz.
-const FRAME_NS: i64 = 32_000_000;
-/// A source timestamp further than this from the contiguous one restarts the carrier timeline.
-const REANCHOR_NS: i64 = 100_000_000;
+pub(crate) const FRAME_NS: i64 = 32_000_000;
+/// Only sub-millisecond container rounding is smoothed. A real gap re-anchors immediately so it
+/// cannot accumulate into a permanent A/V offset.
+const REANCHOR_NS: i64 = 1_000_000;
+
+fn carrier_pts(first_pts: i64, next_pts: Option<i64>) -> i64 {
+    match next_pts {
+        Some(next) if first_pts.checked_sub(next).is_some_and(|delta| delta.unsigned_abs() <= REANCHOR_NS as u64) => next,
+        _ => first_pts,
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Packer {
@@ -435,10 +544,7 @@ impl Packer {
         }
         let period = BURST * if WIDE.load(Ordering::Acquire) { HBR } else { 1 };
         push(std::mem::take(&mut self.acc).into_iter().enumerate().map(|(i, b)| ((i * period) as u32, b)).collect());
-        let pts = match self.next_pts {
-            Some(next) if (self.first_pts - next).abs() <= REANCHOR_NS => next,
-            _ => self.first_pts,
-        };
+        let pts = carrier_pts(self.first_pts, self.next_pts);
         self.next_pts = Some(pts + FRAME_NS);
         Ok(Some(pts))
     }
@@ -472,8 +578,12 @@ pub(crate) struct Pcmhd {
 
 impl Pcmhd {
     /// Add one DTS-HD frame. `Ok(None)` until three are gathered, then the dense [`PCMHD_CHUNK`]
-    /// and the timestamp it plays at. `Err` when even the core fits no type IV burst.
-    pub(crate) fn frame(&mut self, frame: &[u8], core_len: usize, pts: i64) -> Result<Option<(i64, Vec<u8>)>, ()> {
+    /// and the timestamp it plays at. `Err` unless its header proves the supported 48 kHz/512
+    /// sample shape, or when even the core fits no type IV burst.
+    pub(crate) fn frame(&mut self, frame: &[u8], core_len: usize, timing: DtsTiming, pts: i64) -> Result<Option<(i64, Vec<u8>)>, ()> {
+        if !timing.supported() || core_len == 0 || core_len > frame.len() {
+            return Err(());
+        }
         let mut burst = dtshd_burst(frame, core_len, true).ok_or(())?;
         let used = 20 + usize::from(u16::from_be_bytes([burst[18], burst[19]]));
         burst.truncate(used);
@@ -488,17 +598,27 @@ impl Pcmhd {
         if self.acc.len() < 3 {
             return Ok(None);
         }
+        Ok(self.emit())
+    }
+
+    /// Emit the final one or two frames at natural EOF. The AU stays a fixed 32 ms PCM chunk;
+    /// unused burst slots are zero padding, so no DTS bytes are silently discarded.
+    pub(crate) fn finish(&mut self) -> Option<(i64, Vec<u8>)> {
+        self.emit()
+    }
+
+    fn emit(&mut self) -> Option<(i64, Vec<u8>)> {
+        if self.acc.is_empty() {
+            return None;
+        }
         let period = BURST * HBR;
         let mut out = vec![0u8; PCMHD_CHUNK];
         for (i, b) in std::mem::take(&mut self.acc).into_iter().enumerate() {
             out[i * period..i * period + b.len()].copy_from_slice(&b);
         }
-        let pts = match self.next_pts {
-            Some(next) if (self.first_pts - next).abs() <= REANCHOR_NS => next,
-            _ => self.first_pts,
-        };
+        let pts = carrier_pts(self.first_pts, self.next_pts);
         self.next_pts = Some(pts + FRAME_NS);
-        Ok(Some((pts, out)))
+        Some((pts, out))
     }
 
     pub(crate) fn reset(&mut self) {
@@ -695,9 +815,8 @@ mod tests {
 
     /// The carrier is process-global state (one LG ES renderer per process); tests that touch it
     /// take this lock so cargo's parallel runner cannot interleave them.
-    static GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn globals() -> std::sync::MutexGuard<'static, ()> {
-        GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
+        super::PCMHD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -835,20 +954,34 @@ mod tests {
         assert_eq!(p.frame(&frame, 0, 10), Ok(None));
         assert_eq!(p.frame(&frame, 0, 20), Ok(None));
         assert_eq!(p.frame(&frame, 0, 30), Ok(Some(10)));
-        // Stretched or rounded source timestamps: the carrier stays contiguous...
-        for t in [44_000_000, 55_000_000, 66_000_000] {
+        // Half a millisecond of rounding is smoothed; a real 50 ms gap is not.
+        for t in [42_000_500, 52_000_500, 62_000_500] {
             p.frame(&frame, 0, t).ok();
         }
-        assert_eq!(p.frame(&frame, 0, 0).ok(), Some(None));
-        assert_eq!(p.frame(&frame, 0, 0).ok(), Some(None));
-        assert_eq!(p.frame(&frame, 0, 0).ok(), Some(Some(32_000_010 + 32_000_000)));
-        // ...until the source jumps (a seek or a discontinuity).
-        for t in [900_000_000, 910_000_000] {
+        assert_eq!(p.frame(&frame, 0, 72_000_500).ok(), Some(None));
+        assert_eq!(p.frame(&frame, 0, 82_000_500).ok(), Some(None));
+        assert_eq!(p.frame(&frame, 0, 92_000_500), Ok(Some(42_000_010)));
+        for t in [142_000_500, 152_000_500] {
             p.frame(&frame, 0, t).ok();
         }
-        assert_eq!(p.frame(&frame, 0, 920_000_000), Ok(Some(900_000_000)));
+        assert_eq!(p.frame(&frame, 0, 162_000_500), Ok(Some(142_000_500)));
         let q = super::QUEUE.lock().unwrap();
         assert_eq!(q.back().map(|c| c.iter().map(|(_, v)| v.len()).sum::<usize>()), Some(3 * (20 + 100)));
+    }
+
+    #[test]
+    fn only_rounding_is_smoothed_and_real_gaps_never_accumulate() {
+        let next = 1_000_000_000;
+        for jitter in [0, 500_000, 1_000_000, -500_000, -1_000_000] {
+            assert_eq!(super::carrier_pts(next + jitter, Some(next)), next);
+        }
+        for gap in [1_000_001, 5_000_000, 50_000_000, 100_000_000, 101_000_000, -5_000_000] {
+            assert_eq!(super::carrier_pts(next + gap, Some(next)), next + gap, "gap {gap}");
+        }
+        // Two sub-threshold offsets relative to separate anchors are not added together: each
+        // group compares its own source timestamp with the immediately preceding lattice point.
+        assert_eq!(super::carrier_pts(next + 500_000, Some(next)), next);
+        assert_eq!(super::carrier_pts(next + 32_000_000 + 500_000, Some(next + 32_000_000)), next + 32_000_000);
     }
 
     fn render(chunk: &super::Chunk, size: usize) -> Vec<u8> {
@@ -930,9 +1063,10 @@ mod tests {
         let mut p = super::Pcmhd::default();
         let mut frame = vec![0x5au8; 2568];
         frame[..4].copy_from_slice(&[0x7f, 0xfe, 0x80, 0x01]);
-        assert_eq!(p.frame(&frame, frame.len(), 1_000_000_000), Ok(None));
-        assert_eq!(p.frame(&frame, frame.len(), 1_010_666_666), Ok(None));
-        let (pts, chunk) = p.frame(&frame, frame.len(), 1_021_333_333).unwrap().unwrap();
+        let timing = super::DtsTiming::SUPPORTED;
+        assert_eq!(p.frame(&frame, frame.len(), timing, 1_000_000_000), Ok(None));
+        assert_eq!(p.frame(&frame, frame.len(), timing, 1_010_666_666), Ok(None));
+        let (pts, chunk) = p.frame(&frame, frame.len(), timing, 1_021_333_333).unwrap().unwrap();
         // The first frame's own timestamp anchors the chunk (stretched source timestamps stay on
         // the carrier's 32 ms lattice, as for the C1 path).
         assert_eq!(pts, 1_000_000_000);
@@ -946,7 +1080,7 @@ mod tests {
         }
         // The next chunk keeps the lattice, not the source's timestamps.
         for _ in 0..3 {
-            let _ = p.frame(&frame, frame.len(), 5_000_000_000);
+            let _ = p.frame(&frame, frame.len(), timing, 5_000_000_000);
         }
         assert_eq!(p.summary(), (6, 0), "core-only frames are counted as such");
     }
@@ -958,11 +1092,85 @@ mod tests {
     fn pcmhd_refuses_a_frame_that_fits_no_burst() {
         let mut p = super::Pcmhd::default();
         let huge = vec![0u8; 40_000];
-        assert!(p.frame(&huge, 0, 0).is_err(), "no core to fall back to and the frame is too big");
+        let timing = super::DtsTiming::SUPPORTED;
+        assert!(p.frame(&huge, 0, timing, 0).is_err(), "no core to fall back to and the frame is too big");
         assert!(
-            p.frame(&huge, 32_750, 0).is_err(),
+            p.frame(&huge, 32_750, timing, 0).is_err(),
             "a core larger than the 32748-byte payload slot (32768 - 8 - 12 header bytes)"
         );
         assert_eq!(p.summary(), (0, 0), "a refused frame is not counted");
+    }
+
+    #[test]
+    fn pcmhd_refuses_every_timing_other_than_48k_512_samples() {
+        let mut p = super::Pcmhd::default();
+        let frame = vec![1u8; 100];
+        for timing in [
+            super::DtsTiming { sample_rate: 44_100, blocks: 16 },
+            super::DtsTiming { sample_rate: 48_000, blocks: 15 },
+            super::DtsTiming { sample_rate: 48_000, blocks: 17 },
+            super::DtsTiming { sample_rate: 96_000, blocks: 32 },
+            super::DtsTiming { sample_rate: 192_000, blocks: 64 },
+        ] {
+            assert!(p.frame(&frame, 0, timing, 0).is_err(), "unsupported {timing:?}");
+        }
+        assert_eq!(p.summary(), (0, 0));
+        assert!(super::DtsTiming { sample_rate: 48_000, blocks: 16 }.supported());
+    }
+
+    #[test]
+    fn pcmhd_finish_flushes_every_partial_group_with_zero_padding() {
+        for count in 0..6usize {
+            let mut p = super::Pcmhd::default();
+            let frame = vec![7u8; 100];
+            let mut emitted = Vec::new();
+            for i in 0..count {
+                if let Some(chunk) = p.frame(&frame, frame.len(), super::DtsTiming::SUPPORTED, i as i64 * 10_666_666).unwrap() {
+                    emitted.push(chunk);
+                }
+            }
+            if let Some(chunk) = p.finish() {
+                emitted.push(chunk);
+            }
+            assert_eq!(emitted.len(), count.div_ceil(3), "EOF after {count} frames");
+            for (n, (pts, chunk)) in emitted.iter().enumerate() {
+                assert_eq!(*pts, n as i64 * super::FRAME_NS);
+                assert_eq!(chunk.len(), super::PCMHD_CHUNK);
+                let bursts = if count - n * 3 >= 3 { 3 } else { count - n * 3 };
+                for i in 0..3 {
+                    let b = &chunk[i * 32768..(i + 1) * 32768];
+                    if i < bursts {
+                        assert_eq!(&b[20..120], &frame[..]);
+                    } else {
+                        assert!(b.iter().all(|byte| *byte == 0), "unused burst {i} must be padding");
+                    }
+                }
+            }
+            assert!(p.finish().is_none(), "finish is idempotent");
+        }
+    }
+
+    #[test]
+    fn pcmhd_caps_handshake_is_generation_scoped_and_fails_closed() {
+        let _g = globals();
+        super::set_pcmhd(true);
+        let session = super::nj_pcmhd_session_load();
+        assert!(!super::pcmhd_wait_ready_for(std::time::Duration::ZERO), "no accepted CAPS means no feed");
+        super::nj_pcmhd_sink_ready(session + 1);
+        assert!(!super::PCMHD_SINK_READY.load(std::sync::atomic::Ordering::Acquire));
+        super::nj_pcmhd_sink_ready(session);
+        assert!(super::PCMHD_SINK_READY.load(std::sync::atomic::Ordering::Acquire));
+        super::set_pcmhd(false);
+        super::set_pcmhd(true);
+        super::nj_pcmhd_sink_refused(session);
+        assert!(super::pcmhd(), "stale callback must not disarm a later generation");
+        assert!(!super::PCMHD_SINK_REFUSED.load(std::sync::atomic::Ordering::Acquire));
+        super::set_pcmhd(false);
+        super::set_pcmhd(true);
+        let session = super::nj_pcmhd_session_load();
+        super::nj_pcmhd_sink_refused(session);
+        assert!(!super::pcmhd(), "current refusal disarms the feed");
+        assert_eq!(super::nj_pcmhd_armed_load(), 0);
+        super::set_pcmhd(false);
     }
 }

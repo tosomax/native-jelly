@@ -65,6 +65,7 @@ pub(super) fn test_original_candidate(subtitle_ordinal: Option<i32>) -> AutoOrig
             ordinal: 1,
             codec: "eac3".into(),
             channels: 6,
+            sample_rate: 0,
             can_normalize_loudness: false,
             immersive: true,
         }),
