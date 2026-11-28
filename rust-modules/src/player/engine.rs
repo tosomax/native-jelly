@@ -1123,7 +1123,11 @@ fn build_av_payload(ps: &crate::route::PlaybackSession, video: &str, audio: &str
         ));
     }
     let p = with_dolby_hdr_info(&p, video, crate::route::stream_dv_presentation(ps));
-    with_iec_pcm_info(&with_immersive(&p, audio, crate::route::stream_immersive(ps)), audio)
+    with_dts_info(
+        &with_iec_pcm_info(&with_immersive(&p, audio, crate::route::stream_immersive(ps)), audio),
+        audio,
+        crate::route::stream_achannels(ps),
+    )
 }
 
 /// Is the sound going to a receiver for this start, so `what` (DTS or TrueHD) may go out as a
@@ -1146,6 +1150,33 @@ fn receiver_ready(caps: &nj_platform::devcaps::Caps, what: &str) -> bool {
         output.label()
     ));
     ready
+}
+
+/// EXPERIMENT (`acodec`): the DTS-family name to declare, from the trigger's value. LG's libpf
+/// creates distinct caps for each (`Create DTS Audio Caps`, `Create DTS-X Audio Caps`,
+/// `Create DTS Express Audio Caps`).
+fn dts_declared_name() -> &'static str {
+    match nj_base::devtrig::read("acodec").as_deref() {
+        Some("DTSX") | Some("dtsx") => "DTSX",
+        Some("DTSE") | Some("dtse") => "DTSE",
+        _ => "DTS",
+    }
+}
+
+/// EXPERIMENT: the `contents.dtsInfo` node LG's libpf builds its DTS caps from
+/// (`option.externalStreamingInfo.contents.dtsInfo`, `PF_EXT_DTS_CHANNELS` /
+/// `PF_EXT_DTS_SAMPLERATE` in `/usr/lib/libpf-1.0.so` on this set). Spliced at the same
+/// `provider` anchor as the other per-codec nodes; any other declaration is unchanged.
+fn with_dts_info(p: &str, audio: &str, channels: i64) -> String {
+    if !matches!(audio, "DTS" | "DTSX" | "DTSE") {
+        return p.to_string();
+    }
+    let anchor = r#""provider":"nativejelly""#;
+    if p.matches(anchor).count() != 1 || p.contains(r#""dtsInfo""#) {
+        return p.to_string();
+    }
+    let ch = if channels > 0 { channels.min(8) } else { 6 };
+    p.replace(anchor, &format!(r#"{anchor},"dtsInfo":{{"channels":{ch},"samplerate":48}}"#))
 }
 
 /// The `PCM` declaration DTS passthrough uses: LG's 2-channel 48 kHz S16 input, the one PCM shape
@@ -1719,6 +1750,19 @@ fn start_bufferfeed_inner(
                 log(&format!("start_bufferfeed: {codec} audio is converted to AC3 on the television"));
             }
             dts_iec = ac == "DTS" && receiver_ready(&caps, "DTS");
+            // EXPERIMENT (`acodec`): declare the DTS family natively, with LG's own `dtsInfo`
+            // node, instead of the PCM/DD+ carrier. LG's libpf creates distinct caps for `DTS`,
+            // `DTSX` and `DTSE` and reads `contents.dtsInfo` (channels, samplerate); without the
+            // node a `DTS` Load is refused with 18/601 on this firmware. The trigger's value picks
+            // the name (`DTSX` for DTS-HD MA/X, `DTSE`, or `DTS`), so one build tries them all.
+            let dts_native = ac == "DTS" && nj_base::devtrig::read("acodec").is_some();
+            if dts_native {
+                dts_iec = false;
+                log(&format!(
+                    "start_bufferfeed: DTS declared natively as {} + dtsInfo (experiment)",
+                    dts_declared_name()
+                ));
+            }
             // Lossless audio: DTS-HD over the DD+ carrier (es_carrier) replaces the PCM core carrier;
             // `pump` falls back to the core if LG's DD+ route turns out not to be in pass-through.
             let carrier = dts_iec && crate::player::es_carrier::available();
@@ -1726,7 +1770,7 @@ fn start_bufferfeed_inner(
             if carrier {
                 log(&format!("start_bufferfeed: DTS-HD over the DD+ pass-through carrier ({})", if hbr { "HBR" } else { "192 kHz" }));
             }
-            let ac = if carrier || truehd { "AC3 PLUS" } else if dts_iec { "PCM" } else { ac };
+            let ac = if dts_native { dts_declared_name() } else if carrier || truehd { "AC3 PLUS" } else if dts_iec { "PCM" } else { ac };
             SHARED.dg_load_a.store(diagnostic, Ordering::Relaxed);
             audio_declared = ac;
             // The sink envelope — `adaptiveStreaming`'s maxWidth/maxHeight/maxFrameRate — used
