@@ -169,6 +169,9 @@ struct hook_log_state {
 static struct hook_log_state make_logged;
 static struct hook_log_state create_logged;
 
+/* Defined below with the other dlsym helpers; needed here to resolve g_free. */
+static void *lib(const char *soname);
+
 /* lib() never loads a new library for a name that is not already present unless the call can
  * legitimately need it; g_free is the public GLib counterpart of gst_object_get_name(). */
 static void free_name_locked(char *name) {

@@ -342,6 +342,9 @@ class PcmhdSourceContractTests(unittest.TestCase):
         self.assertIn('dlsym(gst, "gst_element_factory_create")', hook)
         self.assertIn('dlsym(gst, "gst_object_get_name")', hook)
         self.assertIn('dlsym(glib, "g_free")', hook)
+        self.assertLess(hook.index("static void *lib(const char *soname);"),
+                        hook.index("static void free_name_locked(char *name)"),
+                        "lib() must be declared before free_name_locked uses it (-Werror)")
         self.assertGreaterEqual(hook.count("install_locked(element, session);"), 2)
         self.assertIn("-Wl,--export-dynamic-symbol=gst_element_factory_create", makefile)
         self.assertIn("uint64_t nj_pcmhd_make_calls(void)", hook)
