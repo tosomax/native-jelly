@@ -1794,24 +1794,38 @@ fn start_bufferfeed_inner(
             if converted {
                 log(&format!("start_bufferfeed: {codec} audio is converted to AC3 on the television"));
             }
-            dts_iec = ac == "DTS" && receiver_ready(&caps, "DTS");
+            // Read every carrier gate exactly once per start, so the arm decision and the
+            // diagnostic log can never disagree. `receiver_ready` is still consulted only for a
+            // DTS track (short circuit), leaving the ordinary DTS passthrough path unchanged.
+            let sample_rate = crate::route::stream_asample_rate(ps);
+            let pcmhd_requested = crate::player::es_carrier::pcmhd_requested();
+            let pcmhd_force = crate::player::es_carrier::pcmhd_force();
+            let webos_major = nj_platform::tv::device::info().major;
+            let pcmhd_firmware_ok =
+                crate::player::es_carrier::pcmhd_firmware_allowed(webos_major, pcmhd_force);
+            let dts_receiver_ready = ac == "DTS" && receiver_ready(&caps, "DTS");
+            dts_iec = dts_receiver_ready;
             // webOS 25: the C1's ioctl route does not exist (no `0x40285207` in its libraries),
             // so the same bursts go out as raw PCM that `audiosink` takes for a bitstream. Dev
-            // trigger only, webOS 25 only, and the transform of the Load below is PCM 192k/8ch.
+            // trigger only; a diagnostic force trigger may bypass the firmware-major gate, never
+            // the receiver, sample rate or CAPS handshake. The Load transform below is PCM 192k/8ch.
             // `docs/agent-reports/es-carrier-webos25.md` §4.3-5 is the evidence.
-            let pcmhd = dts_iec
-                && crate::player::es_carrier::pcmhd_firmware()
-                && crate::player::es_carrier::pcmhd_requested()
-                && crate::route::stream_asample_rate(ps) == 48_000;
+            let pcmhd = dts_iec && pcmhd_firmware_ok && pcmhd_requested && sample_rate == 48_000;
             pcmhd_start.set(pcmhd);
             #[cfg(feature = "devtriggers")]
             {
-                if dts_iec && crate::player::es_carrier::pcmhd_requested() && !pcmhd {
-                    log(&format!(
-                        "start_bufferfeed: PCM carrier NOT armed — needs webOS 25, a receiver, and a known 48000 Hz DTS source (webOS {}, source rate {})",
-                        nj_platform::tv::device::info().major,
-                        crate::route::stream_asample_rate(ps)
-                    ));
+                // Diagnostic only: report all gates when either carrier trigger is armed, even
+                // when the carrier stays down. No extra log on an ordinary, untriggered start.
+                let gates = format!(
+                    "webOS major {webos_major}, required major {}, force {pcmhd_force}, pcmhd trigger {pcmhd_requested}, caps.dts_passthrough {}, receiver_ready {dts_receiver_ready}, dts_iec {dts_iec}, sample rate {sample_rate}",
+                    crate::player::es_carrier::PCMHD_MEASURED_MAJOR,
+                    caps.dts_passthrough
+                );
+                if pcmhd_requested || pcmhd_force {
+                    log(&format!("start_bufferfeed: PCM carrier gates: {gates}"));
+                    if !pcmhd {
+                        log(&format!("start_bufferfeed: PCM carrier NOT armed — {gates}"));
+                    }
                 }
             }
             // Lossless audio: DTS-HD over the DD+ carrier (es_carrier) replaces the PCM core carrier;

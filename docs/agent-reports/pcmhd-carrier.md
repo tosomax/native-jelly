@@ -25,6 +25,34 @@ Ogni condizione mancante rifiuta il percorso. In particolare, un sample rate sco
 assunto, un header non 48k/512 non viene ritemporizzato, e un hook mai intercettato non può far
 passare rumore PCM.
 
+### Trigger diagnostico `pcmhd-force` (build app-scoped per webOS 10)
+
+Il test TV DTS-X di `9607c2e3` (28/11/2026, evidenza conservata nel workspace principale) è fallito **prima dell'arming**:
+la app legge `release=10.3.1 major=10`, mentre il gate firmware richiedeva `major == 25`. Per
+poter diagnosticare i gate successivi su quella TV, questa revisione aggiunge un secondo trigger
+**, solo nelle build con `devtriggers`**:
+
+- file `<runtime>/nativejelly-pcmhd-force` (debug app:
+  `/tmp/com.sostk.nativejelly.debug/nativejelly-pcmhd-force`), letto con
+  `nj_base::devtrig::flag("pcmhd-force")`;
+- funzione pura `pcmhd_firmware_allowed(major, forced) = pcmhd_measured(major) || forced`: il
+  valore misurato `25` resta il gate normale, `forced` aggira **solo** il gate del major;
+- `engine.rs` legge il major reale e il force una sola volta e chiama
+  `pcmhd_firmware_allowed(major, force)`, così decisione e log non possono divergere.
+
+Il force **non abilita da sé alcun feed**: per armare servono ancora il trigger `pcmhd`, un
+receiver DTS (`dts_iec`), i caps `dts_passthrough`, un sample rate noto pari a 48000 Hz e — soprattutto
+— l'handshake CAPS accettato dalla probe C prima del primo chunk. Nessuna patch di sistema, nessuna
+modifica alle impostazioni audio della TV, nessun behavior change senza i trigger: in assenza di
+`pcmhd` e `pcmhd-force` il percorso è esattamente quello di prima. Il trigger resta un esperimento
+dev, non un default di produzione; il fatto che il sink accetti le caps carrier resta da provare.
+
+Il gate finale in `engine.rs` è calcolato una sola volta per start:
+
+```
+pcmhd = dts_iec && pcmhd_firmware_ok && pcmhd_requested && sample_rate == 48_000
+```
+
 ### Load
 
 `audio: "PCM"`, `pcmInfo` S16LE / `8-channel` / interleaved / 192 kHz / 16 bit.
@@ -123,6 +151,14 @@ donor, non dimostra il comportamento del renderer.
 - `ff: PCM carrier ...`;
 - in caso di rifiuto: `PCM carrier refused ...` e nessun feed carrier.
 
+Con `pcmhd` o `pcmhd-force` armati, ogni start registra una riga
+`start_bufferfeed: PCM carrier gates:` con: major webOS reale, major richiesto (25), force
+attivo, trigger `pcmhd` attivo, `caps.dts_passthrough`, `receiver_ready`, `dts_iec` e sample rate.
+Lo stesso insieme di valori essenziali è ripetuto su `PCM carrier NOT armed — ...`, che ora viene scritta
+anche quando il carrier non si arma prima del receiver: è questa la riga che mancava nel test di
+`9607c2e3` e che distingue un gate firmware falso da un caps/receiver falsi. Nessuna riga aggiuntiva
+viene scritta per uno start ordinario senza trigger.
+
 `/tmp/nativejelly-pcmhd-sink.log`:
 
 - `symbols resolved through public GStreamer/GObject APIs`;
@@ -175,3 +211,12 @@ Python del gate ELF, verifica statica del carrier quando il corpus locale è dis
 Non eseguite: `cargo`, `make`, compilazione C, harness C, build ARM/IPK, deploy, TV, Docker, pull di
 dipendenze. I vecchi risultati Docker riportati nel commit `55d15b6b` riguardano il prototipo
 precedente e non provano questa revisione.
+
+### Aggiornamento alla revisione diagnostica `dts-pcm-major10-diag`
+
+Aggiunti `pcmhd-force`, la funzione pura `pcmhd_firmware_allowed` e i log dei gate. Il verificatore
+statico `docs/agent-reports/verify-pcmhd-carrier.py` è stato aggiornato in modo minimale e **strettamente
+necessario**: i valori dei gate in `engine.rs` sono ora variabili locali lette una volta sola (non più
+chiamate inline), quindi il controllo sul sample rate segue `let sample_rate = ...;` +
+`sample_rate == 48_000` invece della vecchia espressione inline; sono state aggiunte due asserzioni
+testuali per il trigger force e per il log dei gate. Nessun gate è stato rilassato.

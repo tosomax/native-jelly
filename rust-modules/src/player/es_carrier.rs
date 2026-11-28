@@ -28,6 +28,13 @@
 //! header proves 512-sample frames is admitted, and no chunk is fed until the C probe reports
 //! accepted carrier CAPS. Nothing here is enabled by default and nothing claims the end-to-end path
 //! is proven: `docs/agent-reports/pcmhd-carrier.md` records the evidence and unproven steps.
+//!
+//! A second, app-scoped diagnostic trigger (`<runtime>/nativejelly-pcmhd-force`) lets a build with
+//! `devtriggers` run that same carrier on a webOS 10 report where the app reads major 10 rather
+//! than 25. It bypasses ONLY the firmware-major gate: the `pcmhd` trigger, a DTS receiver, the
+//! known 48000 Hz source and the accepted-CAPS handshake are all still required before a single
+//! carrier byte is fed. It is a dev switch in this process, not a system patch, and it changes
+//! nothing when absent.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -167,20 +174,34 @@ fn firmware_measured(major: u32) -> bool {
 
 /// The webOS major the PCM carrier's caps hook was written against: webOS 25, whose ES path is the
 /// GStreamer `audiosink` and not the C1's renderer ioctl. Anywhere else the hook is never armed
-/// (`docs/agent-reports/es-carrier-webos25.md` §2, §4.3).
-const PCMHD_MEASURED_MAJOR: u32 = 25;
+/// (`docs/agent-reports/es-carrier-webos25.md` §2, §4.3), unless the explicit diagnostic force
+/// trigger below is armed. `pub(crate)` so the engine can log the required major beside the one it
+/// actually read.
+pub(crate) const PCMHD_MEASURED_MAJOR: u32 = 25;
 
-/// Is this the firmware the PCM carrier was written for?
-pub(crate) fn pcmhd_firmware() -> bool {
-    pcmhd_measured(nj_platform::tv::device::info().major)
+/// Pure form of the firmware gate, so every branch can be tested without a TV: the measured webOS
+/// major is admitted normally; `forced` admits a diagnostic major (the app reads major 10 on a
+/// webOS 10.3.1 G5) **only** when the developer has armed the app-scoped force trigger. This says
+/// nothing about the CAPS handshake, which remains fail-closed in the caller and in the demuxer.
+pub(crate) fn pcmhd_firmware_allowed(major: u32, forced: bool) -> bool {
+    pcmhd_measured(major) || forced
 }
 
 fn pcmhd_measured(major: u32) -> bool {
     major == PCMHD_MEASURED_MAJOR
 }
 
+/// Diagnostic, app-scoped override of the firmware-major gate only (`<runtime>/nativejelly-pcmhd-force`
+/// via the normal `devtrig` path). It never feeds audio by itself: the `pcmhd` trigger, receiver,
+/// 48000 Hz source and accepted CAPS are still checked by the caller and the demuxer. Absent in a
+/// release build, and inert without any other trigger even in a dev build.
+pub(crate) fn pcmhd_force() -> bool {
+    nj_base::devtrig::flag("pcmhd-force")
+}
+
 /// Has the dev trigger asked for the PCM carrier? The trigger only opens the door: the caller also
-/// requires webOS 25 and a receiver, and nothing here is a shipping default.
+/// requires the firmware gate (or its force override) and a receiver, and nothing here is a
+/// shipping default.
 pub(crate) fn pcmhd_requested() -> bool {
     nj_base::devtrig::flag("pcmhd")
 }
@@ -1036,13 +1057,36 @@ mod tests {
     }
 
     /// The webOS 25 carrier exists only where its caps hook was written: webOS 25. Another major
-    /// must never arm it (the ioctl carrier's own rule, for the same reason).
+    /// must never arm it normally (the ioctl carrier's own rule, for the same reason). The pure
+    /// gate below admits a different major only with the explicit diagnostic force trigger; the
+    /// normal measurement stays unchanged.
     #[test]
     fn the_pcm_carrier_is_wired_to_webos_25_only() {
         assert!(super::pcmhd_measured(25));
         for major in [0, 3, 4, 5, 6, 7, 10, 22, 24, 26] {
             assert!(!super::pcmhd_measured(major), "webOS {major}: never arm the PCM carrier");
         }
+    }
+
+    /// The G5's app reads webOS major 10. Without the diagnostic force trigger that major stays
+    /// excluded: this is the gate that made the 9607c2e3 test inert before it could arm.
+    #[test]
+    fn webos_10_stays_excluded_without_force() {
+        assert!(!super::pcmhd_firmware_allowed(10, false));
+    }
+
+    /// With the app-scoped force trigger the firmware major gate is explicitly bypassed. Nothing
+    /// else is bypassed here: receiver, source rate and the CAPS handshake are separate gates.
+    #[test]
+    fn webos_10_is_admitted_only_with_force() {
+        assert!(super::pcmhd_firmware_allowed(10, true));
+    }
+
+    /// The measured major remains admitted regardless of the diagnostic trigger.
+    #[test]
+    fn webos_25_is_always_admitted() {
+        assert!(super::pcmhd_firmware_allowed(25, false));
+        assert!(super::pcmhd_firmware_allowed(25, true));
     }
 
     /// One chunk is exactly 32 ms of 192 kHz / 8 ch / 16-bit audio, which is what the Load

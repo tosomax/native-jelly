@@ -82,6 +82,13 @@ elfcheck = read('ci', 'check-elf.sh')
 check('es_carrier declares PCMHD_CHUNK = 98304', 'pub(crate) const PCMHD_CHUNK: usize = 98304;' in carrier)
 check('es_carrier gates the mode to webOS 25', 'const PCMHD_MEASURED_MAJOR: u32 = 25;' in carrier and 'major == PCMHD_MEASURED_MAJOR' in carrier)
 check('es_carrier reads the dev trigger', 'nj_base::devtrig::flag("pcmhd")' in carrier)
+# Diagnostic build: the force trigger bypasses ONLY the pure firmware-major gate; the caller's
+# receiver, sample-rate and CAPS checks are unchanged. Checked as text because this is a tree-only
+# verifier (no Rust toolchain or device in the static lane).
+check('es_carrier has the app-scoped diagnostic force gate',
+      'nj_base::devtrig::flag("pcmhd-force")' in carrier
+      and 'fn pcmhd_firmware_allowed(major: u32, forced: bool)' in carrier
+      and 'pcmhd_measured(major) || forced' in carrier)
 check('es_carrier arms the C hook through atomic accessors', 'nj_pcmhd_armed_store(i32::from(on))' in carrier)
 check('the mode starts OFF', 'static PCMHD: AtomicBool = AtomicBool::new(false);' in carrier)
 check('the demuxer waits for accepted sink CAPS', 'fn pcmhd_wait_ready()' in carrier and 'PCMHD_SINK_READY' in carrier)
@@ -91,11 +98,23 @@ check('Pcmhd timestamps on FRAME_NS', 'self.next_pts = Some(pts + FRAME_NS);' in
 check('Pcmhd rejects unsupported timing', 'if !timing.supported()' in carrier)
 check('Pcmhd flushes a partial EOF group', 'pub(crate) fn finish' in carrier)
 
+# The gate values are now hoisted into locals (one read each) and reused by the diagnostic log,
+# so this check follows the locals rather than the old inline call expressions.
 check('engine requires dts + firmware + trigger + known 48k source',
       'let pcmhd = dts_iec' in engine
-      and 'crate::player::es_carrier::pcmhd_firmware()' in engine
-      and 'crate::player::es_carrier::pcmhd_requested()' in engine
-      and 'crate::route::stream_asample_rate(ps) == 48_000' in engine)
+      and 'let pcmhd_firmware_ok =' in engine
+      and 'crate::player::es_carrier::pcmhd_firmware_allowed(webos_major, pcmhd_force)' in engine
+      and 'let pcmhd_requested = crate::player::es_carrier::pcmhd_requested();' in engine
+      and 'let pcmhd_force = crate::player::es_carrier::pcmhd_force();' in engine
+      and 'let sample_rate = crate::route::stream_asample_rate(ps);' in engine
+      and 'sample_rate == 48_000' in engine)
+check('engine logs every PCM carrier gate, armed or not',
+      'PCM carrier gates:' in engine
+      and 'PCM carrier NOT armed' in engine
+      and 'caps.dts_passthrough' in engine
+      and 'receiver_ready {dts_receiver_ready}' in engine
+      and 'dts_iec {dts_iec}' in engine
+      and 'sample rate {sample_rate}' in engine)
 check('engine rolls arming back on every failed start', 'struct PcmhdStartGuard' in engine and 'if !self.committed' in engine)
 check('engine disarms at teardown', 'crate::player::es_carrier::set_pcmhd(false);' in engine)
 check('the 3 MB/s audio lane gets 4x its byte cap in this mode',
