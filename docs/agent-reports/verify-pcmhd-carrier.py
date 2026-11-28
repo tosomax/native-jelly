@@ -140,7 +140,11 @@ check('hook does not resolve non-exported GLib class macros',
 check('hook is inert without the armed flag', '!nj_pcmhd_armed_load()' in hook)
 
 check('Makefile exports the factory hook only with devtriggers',
-      'PCMHD_HOOK ?=' in makefile and '$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)' in makefile)
+      'PCMHD_HOOK ?=' in makefile
+      and '$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)' not in makefile
+      and 'ifneq ($(filter 1,$(PCMHD_HOOK)),)\n'
+          'SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make\n'
+          'endif' in makefile)
 check('check-elf is feature-aware', 'PCMHD_HOOK="${PCMHD_HOOK:-0}"' in elfcheck and 'non-devtriggers build must not define/import' in elfcheck)
 
 print()

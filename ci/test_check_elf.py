@@ -313,7 +313,10 @@ class PcmhdSourceContractTests(unittest.TestCase):
         makefile = (ROOT / "Makefile").read_text()
         self.assertIn("PCMHD_HOOK ?=", makefile)
         self.assertIn("src/pcmhd_sink.c,$(wildcard src/*.c)", makefile)
-        self.assertIn("$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)", makefile)
+        self.assertNotIn("$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)", makefile)
+        self.assertIn("ifneq ($(filter 1,$(PCMHD_HOOK)),)\n"
+                      "SMP_INTERPOSER_LDFLAG += -Wl,--export-dynamic-symbol=gst_element_factory_make\n"
+                      "endif", makefile)
         carrier = (ROOT / "rust-modules/src/player/es_carrier.rs").read_text()
         feed = (ROOT / "rust-modules/src/ff.rs").read_text()
         self.assertIn("timing.supported()", carrier)
@@ -321,6 +324,87 @@ class PcmhdSourceContractTests(unittest.TestCase):
         self.assertIn("pcmhd_wait_ready()", feed)
         self.assertIn("dts_core_timing(&core)", feed)
         self.assertIn("rate != 48_000", feed)
+
+
+class PcmhdLdflagExpansionTests(unittest.TestCase):
+    """Statically expand the Makefile's export guard — no `make`, no build, no toolchain.
+
+    Regression for CI ARM run 46157912726: the old line was
+
+        SMP_INTERPOSER_LDFLAG += $(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)
+
+    make splits an `if`'s arguments on every *top-level* comma, so the then-branch
+    was only `-Wl` and `--export-dynamic-symbol=...` was parsed as the else-branch;
+    the linker driver then rejected the bare `-Wl`. The flag now lives in a real
+    `ifneq` block, where its comma is literal. These tests parse that block out of
+    the Makefile and evaluate its two outcomes exactly.
+    """
+
+    FLAG = "-Wl,--export-dynamic-symbol=gst_element_factory_make"
+
+    @staticmethod
+    def _split_args(text):
+        """Split on commas outside $(...) — the nesting make's own parser honours."""
+        parts, current, depth = [], [], 0
+        for ch in text:
+            if ch == ",":
+                if depth == 0:
+                    parts.append("".join(current))
+                    current = []
+                    continue
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            current.append(ch)
+        parts.append("".join(current))
+        return parts
+
+    @classmethod
+    def _expand(cls, text, variables):
+        text = re.sub(r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)",
+                      lambda m: variables.get(m.group(1), ""), text)
+        return re.sub(r"\$\(filter\s+([^,)]+),([^)]*)\)",
+                      lambda m: " ".join(w for w in m.group(2).split() if w == m.group(1)), text)
+
+    def _guard_and_flag(self):
+        makefile = (ROOT / "Makefile").read_text()
+        match = re.search(
+            r"^(?P<guard>if(?:eq|neq)\s+\(.*\))\n"
+            r"^SMP_INTERPOSER_LDFLAG\s*\+=\s*(?P<flag>[^\n]*gst_element_factory_make[^\n]*)\n"
+            r"^endif\b",
+            makefile, re.M,
+        )
+        self.assertIsNotNone(match, "gst_element_factory_make export must sit in an ifeq/ifneq block")
+        directive, args = match.group("guard").split(None, 1)
+        lhs, rhs = self._split_args(args.strip()[1:-1])
+        return directive, lhs.strip(), rhs.strip(), match.group("flag").strip()
+
+    def _expanded_flag(self, pcmhd_hook):
+        directive, lhs, rhs, flag = self._guard_and_flag()
+        self.assertEqual(flag, self.FLAG, "the guarded line must append exactly one linker flag")
+        variables = {"PCMHD_HOOK": pcmhd_hook}
+        left, right = self._expand(lhs, variables), self._expand(rhs, variables)
+        taken = (left == right) if directive == "ifeq" else (left != right)
+        return flag if taken else ""
+
+    def test_hook_one_expands_to_the_exact_flag(self):
+        self.assertEqual(self._expanded_flag("1"), self.FLAG)
+        self.assertEqual(self._expanded_flag("1 "), self.FLAG)
+
+    def test_hook_zero_or_empty_expands_to_nothing(self):
+        self.assertEqual(self._expanded_flag("0"), "")
+        self.assertEqual(self._expanded_flag(""), "")
+
+    def test_old_if_form_split_at_the_comma(self):
+        # Show the bug this fixes: make would read `then` = `-Wl`, and treat the
+        # rest as the else-branch, so gcc saw a bare `-Wl` and failed.
+        old = "$(if $(filter 1,$(PCMHD_HOOK)),-Wl,--export-dynamic-symbol=gst_element_factory_make)"
+        condition, then_branch, else_branch = self._split_args(old[len("$(if "):-1])
+        self.assertEqual(condition.strip(), "$(filter 1,$(PCMHD_HOOK))")
+        self.assertEqual(then_branch.strip(), "-Wl")
+        self.assertEqual(else_branch.strip(), "--export-dynamic-symbol=gst_element_factory_make")
+        self.assertNotIn(old, (ROOT / "Makefile").read_text())
 
 
 class MakeCheckContractTests(unittest.TestCase):
