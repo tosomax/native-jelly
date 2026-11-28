@@ -112,9 +112,21 @@ pub fn dts_passthrough() -> bool {
     DTS_PASSTHROUGH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// EXPERIMENT (`dts-native-restore`): with the same setting on, declare the stream `DTS` and let
+/// the television pack the bitstream (a restored `dts_audiodec` plus the webOS 25 `earc_route`)
+/// instead of the app's own IEC 61937 carrier. Kept beside [`DTS_PASSTHROUGH`] rather than in
+/// [`Caps`] so no struct literal changes; read once per start.
+static DTS_BITSTREAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when the DTS setting asks for a native `DTS` declaration (see [`DTS_BITSTREAM`]).
+pub fn dts_bitstream() -> bool {
+    DTS_BITSTREAM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record the DTS passthrough setting, and when it is on, ask where the sound goes.
 pub fn set_dts_passthrough(on: bool) {
     DTS_PASSTHROUGH.store(on, std::sync::atomic::Ordering::Relaxed);
+    DTS_BITSTREAM.store(on, std::sync::atomic::Ordering::Relaxed);
     if on {
         sound_output::refresh();
     }

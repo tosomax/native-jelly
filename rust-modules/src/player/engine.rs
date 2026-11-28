@@ -1718,7 +1718,10 @@ fn start_bufferfeed_inner(
             if converted {
                 log(&format!("start_bufferfeed: {codec} audio is converted to AC3 on the television"));
             }
-            dts_iec = ac == "DTS" && receiver_ready(&caps, "DTS");
+            dts_iec = ac == "DTS" && receiver_ready(&caps, "DTS") && !nj_platform::devcaps::dts_bitstream();
+            if ac == "DTS" && nj_platform::devcaps::dts_bitstream() {
+                log("start_bufferfeed: DTS declared natively for the receiver (the television's restored dts_audiodec packs the bitstream)");
+            }
             // Lossless audio: DTS-HD over the DD+ carrier (es_carrier) replaces the PCM core carrier;
             // `pump` falls back to the core if LG's DD+ route turns out not to be in pass-through.
             let carrier = dts_iec && crate::player::es_carrier::available();
