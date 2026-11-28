@@ -69,6 +69,8 @@ jobs:
           python3 docs/agent-reports/verify-pcmhd-carrier.py --tree-only
 
       - name: Host C sink regression harness
+        env:
+          TMPDIR: /tmp
         run: bash ci/test-pcmhd-sink.sh
 
       - name: Build ARM binary with PCMHD hook
