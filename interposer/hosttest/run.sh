@@ -24,29 +24,50 @@ $CXX -O2 -g -Wall -Wextra $ABI -o "$SCRATCH/test" test.cpp -L"$SCRATCH" \
 
 echo
 echo "== call site is interposable (readelf mechanism check)"
-# AArch64 names it R_AARCH64_JUMP_SLOT, x86-64 R_X86_64_JUMP_SLOT; both mean a PLT slot the loader
-# can bind to a preloaded definition. Disassembly suffixes are not portable across host toolchains.
+# Parse each row from its right edge: name, Ndx, Vis, Bind, Type. Column numbers before those are
+# not portable across readelf versions/architectures. An undefined call target may be recorded as
+# NOTYPE (or a weak reference) on some hosts; STT does not affect preemption — the JUMP_SLOT
+# relocation below is the proof. UND and JUMP_SLOT stay strict.
 # mock_caller.cpp defines only mock_query, so this is its call site.
 CALLER_DYNSYMS=$(readelf -W --dyn-syms "$SCRATCH/libmockcaller.so")
 ROWS=$(printf '%s\n' "$CALLER_DYNSYMS" | awk -v symbol="$SYMBOL" '$NF == symbol { print }')
 [ "$(printf '%s\n' "$ROWS" | wc -l | tr -d ' ')" -eq 1 ] || {
   echo "FAIL: interposed symbol is not present exactly once in the caller's .dynsym" >&2
+  printf '  rows read:\n%s\n' "$ROWS" >&2
   exit 1
 }
-printf '%s\n' "$ROWS" | awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 == "UND" { ok=1 } END { exit !ok }' || {
-  echo "FAIL: interposed symbol is not an undefined GLOBAL/DEFAULT FUNC in the caller's .dynsym" >&2
+if ! printf '%s\n' "$ROWS" | awk '
+  {
+    type = $(NF-4); bind = $(NF-3); vis = $(NF-2); ndx = $(NF-1)
+    if ((type == "FUNC" || type == "IFUNC" || type == "NOTYPE") &&
+        (bind == "GLOBAL" || bind == "WEAK") &&
+        vis == "DEFAULT" && ndx == "UND") ok = 1
+    else printf "  parsed: type=%s bind=%s vis=%s ndx=%s\n", type, bind, vis, ndx > "/dev/stderr"
+  }
+  END { exit !ok }
+'; then
+  echo "FAIL: interposed symbol is not an UND/default-visibility function in the caller's .dynsym" >&2
+  printf '  row read: %s\n' "$ROWS" >&2
   exit 1
-}
+fi
 printf '%s\n' "$ROWS"
 
 CALLER_RELOCS=$(readelf -W --relocs "$SCRATCH/libmockcaller.so")
+# Find the relocation type anywhere on the line, then the symbol name anywhere in that line's
+# fields (some readelf versions append a version suffix). Both named types are PLT slots; the
+# requirement itself is JUMP_SLOT, not a particular disassembly spelling.
 if ! JUMP=$(printf '%s\n' "$CALLER_RELOCS" | awk -v symbol="$SYMBOL" '
-  $3 == "R_X86_64_JUMP_SLOT" || $3 == "R_AARCH64_JUMP_SLOT" {
-    for (i = 4; i <= NF; i++) if ($i == symbol) { print; found=1 }
+  {
+    slot = 0
+    for (i = 1; i <= NF; i++)
+      if ($i == "R_X86_64_JUMP_SLOT" || $i == "R_AARCH64_JUMP_SLOT") slot = 1
+    if (slot) for (i = 1; i <= NF; i++)
+      if ($i == symbol || index($i, symbol "@") == 1) { print; found = 1 }
   }
   END { exit !found }
 '); then
   echo "FAIL: mock_query has no JUMP_SLOT relocation for the interposed symbol" >&2
+  printf '  relocations read:\n%s\n' "$CALLER_RELOCS" >&2
   exit 1
 fi
 printf '%s\n' "$JUMP"
@@ -100,8 +121,16 @@ ROWS=$(printf '%s\n' "$DYNSYMS" | awk -v symbol="$SYMBOL" '$NF == symbol { print
   echo "FAIL: exact interposer symbol is not present once in .dynsym" >&2
   exit 1
 }
-printf '%s\n' "$ROWS" | awk '$4 == "FUNC" && $5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" { ok=1 } END { exit !ok }' || {
+if ! printf '%s\n' "$ROWS" | awk '
+  {
+    type = $(NF-4); bind = $(NF-3); vis = $(NF-2); ndx = $(NF-1)
+    if (type == "FUNC" && bind == "GLOBAL" && vis == "DEFAULT" && ndx != "UND") ok = 1
+    else printf "  parsed: type=%s bind=%s vis=%s ndx=%s\n", type, bind, vis, ndx > "/dev/stderr"
+  }
+  END { exit !ok }
+'; then
   echo "FAIL: interposer symbol is not a defined GLOBAL/DEFAULT FUNC" >&2
+  printf '  row read: %s\n' "$ROWS" >&2
   exit 1
-}
+fi
 printf '%s\n' "$ROWS"

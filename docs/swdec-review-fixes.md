@@ -40,8 +40,9 @@ realmente prodotto o del comportamento TV.
   e dipendenza DSO nel manifest debug, selettore driver ARM, gate artefatto con output `readelf`
   fittizio e controlli negativi, deploy atomico, allowlist e omissione source bundle.
 - Host C++ runner: marker assente/vuoto/`0`/`1`, kill switch, simbolo chiamato da `mock_query` UND
-  in `.dynsym` con relocation `JUMP_SLOT` (X86_64/AArch64) e simbolo esatto definito `GLOBAL/DEFAULT`;
-  output in directory temporanea.
+  e default-visibility in `.dynsym` (parsing dalle colonne destre, tipo `FUNC`/`IFUNC`/`NOTYPE`)
+  con relocation `JUMP_SLOT` (X86_64/AArch64) e simbolo esatto definito `GLOBAL/DEFAULT`; riga
+  `readelf` stampata in caso di fallimento, output in directory temporanea.
 
 ## Verifiche eseguite
 

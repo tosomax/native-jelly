@@ -114,9 +114,11 @@ Full host suite: `make check` (queues on the machine-wide check lock).
   `ci/test_source_bundle.py` statically pin the layer, deploy/source manifests, exact `NJ_ARM_CXX=1`
   selection, target refusal and workflow event-SHA checkout.
 * `interposer/hosttest/run.sh` is a required cross-build step. It compiles the host mechanism test
-  and fails on a missing interposable call site (the symbol called by `mock_query` must be UND in
-  the caller's `.dynsym` with a `R_X86_64_JUMP_SLOT` / `R_AARCH64_JUMP_SLOT` relocation) or a missing
-  exact exported symbol; no `|| true` can turn either into a skip.
+  and fails on a missing interposable call site (the symbol called by `mock_query` must be UND with
+  default visibility in the caller's `.dynsym` and have a `R_X86_64_JUMP_SLOT` /
+  `R_AARCH64_JUMP_SLOT` relocation; the recorded STT may be `FUNC` or `NOTYPE` depending on the
+  host) or a missing exact exported symbol; no `|| true` can turn either into a skip. Both gates
+  print the `readelf` row they read when they fail.
 * `ci/check-platformfix-elf.py pkg/libplatformfix.so` gates the actual ARM artifact's ELF32/ARMv7
   soft-float identity, exact unversioned `GLOBAL/DEFAULT` definition, `DT_NEEDED`, the documented
   `GLIBCXX_3.4.21` ceiling and le requisiti CXXABI/GCC rilevati. Its canned-readelf regression test

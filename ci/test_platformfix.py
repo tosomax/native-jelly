@@ -119,7 +119,13 @@ class DtsWorkflow(unittest.TestCase):
         self.assertNotIn("objdump", host_test)
         self.assertIn("readelf -W --dyn-syms", host_test)
         self.assertIn("readelf -W --relocs", host_test)
-        self.assertIn('$7 == "UND"', host_test)
+        # Columns are read from the right edge, not by fixed field number, and the row is echoed
+        # on failure so the next CI run reports what readelf actually produced.
+        self.assertIn('ndx = $(NF-1)', host_test)
+        self.assertIn('ndx == "UND"', host_test)
+        self.assertIn('ndx != "UND"', host_test)
+        self.assertIn('type == "NOTYPE"', host_test)
+        self.assertIn("row read:", host_test)
         for relocation in ("R_X86_64_JUMP_SLOT", "R_AARCH64_JUMP_SLOT"):
             self.assertIn(relocation, host_test)
         self.assertIn("-lmockcaller -lmockstock", host_test)
