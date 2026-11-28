@@ -1179,7 +1179,7 @@ fn with_dts_info(p: &str, audio: &str, channels: i64) -> String {
     // declaration wider than the table is what the allocation may be refusing. Clamp to it (the
     // ES still carries the HD extension; only the declared width changes).
     let ch = if channels > 6 { 6 } else if channels > 0 { channels } else { 6 };
-    p.replace(anchor, &format!(r#"{anchor},"dtsInfo":{{"channels":{ch},"samplerate":48}}"#))
+    p.replace(anchor, &format!(r#"{anchor},"dtsInfo":{{"channels":{ch},"sampleRate":48.0}}"#))
 }
 
 /// The `PCM` declaration DTS passthrough uses: LG's 2-channel 48 kHz S16 input, the one PCM shape
