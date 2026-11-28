@@ -1,40 +1,92 @@
-name: v0.11.0 debug IPK
+name: PCM HD carrier fail-closed diagnostic IPK
 
 on:
   workflow_dispatch:
   push:
-    branches: [v011-debug]
+    branches: [ci/dts-pcm-fixed]
 
 permissions:
   contents: read
 
 concurrency:
-  group: v011-debug-${{ github.ref }}
+  group: ci-dts-pcm-fixed-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  host-tests:
+    name: Host Rust unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_NIGHTLY: nightly
+    steps:
+      - name: Check out the exact event commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Provision host Rust and SDL/GL
+        uses: ./.github/actions/host-rust
+        with:
+          sdl: 'true'
+
+      - name: Run default-feature unit suite
+        run: make check-cargo-unit-default
+
   cross-build:
-    name: Build v0.11.0 debug IPK
+    name: Build PCM HD carrier debug IPK
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - name: Check out the experiment branch
+      - name: Check out the exact event commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: v011-debug
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Install nightly Rust
         run: rustup toolchain install nightly --profile minimal --component rust-src
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          workspaces: rust-modules
+          key: pcmhd-armv7-build-std
+
       - id: ndk
         uses: ./.github/actions/webos-ndk
 
-      - name: Build ARM binary
-        run: make WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' -j"$(nproc)"
+      - name: Cache bundled FFmpeg
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/nativejelly/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ci/build-ffmpeg.sh', 'ci/arm-cc.py', 'ci/check-link-evidence.py', 'ci/stage-link-evidence.py', '.github/actions/webos-ndk/action.yml') }}
+
+      - name: Static PCMHD gates
+        run: |
+          python3 ci/test_check_elf.py
+          python3 docs/agent-reports/verify-pcmhd-carrier.py --tree-only
+
+      - name: Host C sink regression harness
+        run: bash ci/test-pcmhd-sink.sh
+
+      - name: Build ARM binary with PCMHD hook
+        run: make WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' PCMHD_HOOK=1 -j"$(nproc)"
+
+      - name: Verify PCMHD ELF export
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+          PCMHD_HOOK: '1'
+        run: ./ci/check-elf.sh
 
       - name: Package debug IPK
-        run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
+        run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' PCMHD_HOOK=1
+
+      - name: Packaging assertions
+        env:
+          REQUIRE_PACKAGE: '1'
+        run: python3 ci/check-package.py
 
       - name: Record package hash
         run: sha256sum pkg/*.ipk
@@ -42,7 +94,7 @@ jobs:
       - name: Upload debug IPK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nativejelly-0.11.0-debug
+          name: nativejelly-dts-pcmhd-${{ github.sha }}
           path: pkg/*.ipk
           if-no-files-found: error
           retention-days: 30
