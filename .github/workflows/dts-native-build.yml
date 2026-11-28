@@ -3,7 +3,7 @@ name: PCM HD carrier fail-closed diagnostic IPK
 on:
   workflow_dispatch:
   push:
-    branches: [ci/dts-pcm-fixed, ci/dts-pcm-major10-diag]
+    branches: [ci/dts-pcm-fixed, ci/dts-pcm-major10-diag, ci/dts-pcm-sink-diag]
 
 permissions:
   contents: read
