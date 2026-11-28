@@ -1,0 +1,48 @@
+name: v0.11.0 debug IPK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [v011-debug]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v011-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-build:
+    name: Build v0.11.0 debug IPK
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check out the experiment branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: v011-debug
+          fetch-depth: 0
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - id: ndk
+        uses: ./.github/actions/webos-ndk
+
+      - name: Build ARM binary
+        run: make WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}' -j"$(nproc)"
+
+      - name: Package debug IPK
+        run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
+
+      - name: Record package hash
+        run: sha256sum pkg/*.ipk
+
+      - name: Upload debug IPK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nativejelly-0.11.0-debug
+          path: pkg/*.ipk
+          if-no-files-found: error
+          retention-days: 30
