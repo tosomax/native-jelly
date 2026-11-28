@@ -1175,7 +1175,10 @@ fn with_dts_info(p: &str, audio: &str, channels: i64) -> String {
     if p.matches(anchor).count() != 1 || p.contains(r#""dtsInfo""#) {
         return p.to_string();
     }
-    let ch = if channels > 0 { channels.min(8) } else { 6 };
+    // EXPERIMENT: the capability table this set carries says DTS/DTSH/DTSE = 6 channels, and a
+    // declaration wider than the table is what the allocation may be refusing. Clamp to it (the
+    // ES still carries the HD extension; only the declared width changes).
+    let ch = if channels > 6 { 6 } else if channels > 0 { channels } else { 6 };
     p.replace(anchor, &format!(r#"{anchor},"dtsInfo":{{"channels":{ch},"samplerate":48}}"#))
 }
 
