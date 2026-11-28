@@ -1182,6 +1182,17 @@ fn with_dts_info(p: &str, audio: &str, channels: i64) -> String {
     p.replace(anchor, &format!(r#"{anchor},"dtsInfo":{{"channels":{ch},"sampleRate":48.0}}"#))
 }
 
+/// The experiment requires all three facts: the `acodec` trigger actually selected a native DTS
+/// declaration, the final payload still names that DTS family, and the boot-latched SWDEC gate is on.
+/// A plain DTS Load with no `acodec` (for example speaker output with no receiver) must stay stock.
+fn software_audio_decoder_requested(
+    audio_declared: &str,
+    dts_native: bool,
+    enabled: bool,
+) -> bool {
+    dts_native && matches!(audio_declared, "DTS" | "DTSX" | "DTSE") && enabled
+}
+
 /// EXPERIMENT (`swdec`): force `option.useSoftwareAudioDecoder=true` into the Load.
 ///
 /// The key lives in `option` — the same object as `appId` and `externalStreamingInfo` — and not
@@ -1708,6 +1719,8 @@ fn start_bufferfeed_inner(
     // report it. "-" is the video-only case, where there is no audio ES to name.
     let mut audio_declared: &str = "-";
     let mut dts_iec = false;
+    // Hoisted with the final declaration: ordinary DTS without `acodec` is not this experiment.
+    let mut dts_native = false;
     // ...and the video name beside it, for the same reason and to keep the codec->name mapping
     // written ONCE (`LoadVideo`): the `load:` line below would otherwise re-read the route and
     // re-derive it.
@@ -1779,7 +1792,7 @@ fn start_bufferfeed_inner(
             // `DTSX` and `DTSE` and reads `contents.dtsInfo` (channels, samplerate); without the
             // node a `DTS` Load is refused with 18/601 on this firmware. The trigger's value picks
             // the name (`DTSX` for DTS-HD MA/X, `DTSE`, or `DTS`), so one build tries them all.
-            let dts_native = ac == "DTS" && nj_base::devtrig::read("acodec").is_some();
+            dts_native = ac == "DTS" && nj_base::devtrig::read("acodec").is_some();
             if dts_native {
                 dts_iec = false;
                 log(&format!(
@@ -1845,13 +1858,16 @@ fn start_bufferfeed_inner(
     // ...and the appId substitution happens here for the same reason, and BEFORE the splice —
     // `with_window_id`'s anchor is the composed `"appId":"<id>"`, so the placeholder has to be
     // gone by then.
-    // EXPERIMENT (`swdec`, o24n): `option.useSoftwareAudioDecoder=true`, only on a Load that
-    // declares a DTS-family audio — i.e. the `acodec` experiment's native declaration. The AC3
-    // fallback that currently allocates stays exactly as it was. Armed on the debug install by
-    // `nativejelly-swdec` (presence, or anything but an explicit false) with `NJ_PLATFORMFIX=0`
-    // as the kill switch; see `nj_base::platformfix`.
-    let swdec = matches!(audio_declared, "DTS" | "DTSX" | "DTSE")
-        && nj_base::platformfix::enabled();
+    // EXPERIMENT (`swdec`, o24n): `option.useSoftwareAudioDecoder=true`, only when `acodec`
+    // selected a native DTS-family declaration AND the final payload still names it. Ordinary DTS
+    // without that trigger is not the experiment, even when SWDEC itself is armed. The gate is
+    // boot-latched with the interposer decision and `NJ_PLATFORMFIX=0` is the kill switch; see
+    // `nj_base::platformfix`.
+    let swdec = software_audio_decoder_requested(
+        audio_declared,
+        dts_native,
+        nj_base::platformfix::enabled(),
+    );
     if swdec {
         #[cfg(feature = "devtriggers")]
         log(&format!(
@@ -3936,6 +3952,31 @@ mod payload_tests {
             assert_eq!(super::with_software_audio_decoder(p, false), p, "{name}");
             assert!(!p.contains("useSoftwareAudioDecoder"), "{name}");
         }
+    }
+
+    #[test]
+    fn swdec_requires_acodec_native_dts_and_the_boot_gate() {
+        for declared in ["DTS", "DTSX", "DTSE"] {
+            assert!(
+                super::software_audio_decoder_requested(declared, true, true),
+                "{declared}"
+            );
+            assert!(
+                !super::software_audio_decoder_requested(declared, true, false),
+                "{declared}"
+            );
+        }
+        // DTS + no acodec + no receiver leaves an ordinary DTS declaration. It must not acquire
+        // the key merely because nativejelly-swdec is armed.
+        assert!(!super::software_audio_decoder_requested("DTS", false, true));
+        assert!(!super::software_audio_decoder_requested("PCM", true, true));
+        assert!(!super::software_audio_decoder_requested("AC3 PLUS", true, true));
+        let ordinary_dts = super::with_software_audio_decoder(
+            PAYLOAD_AV,
+            super::software_audio_decoder_requested("DTS", false, true),
+        );
+        assert_eq!(ordinary_dts, PAYLOAD_AV);
+        assert!(!ordinary_dts.contains("useSoftwareAudioDecoder"));
     }
 
     /// Armed: exactly one `option.useSoftwareAudioDecoder:true`, inside `option` (not

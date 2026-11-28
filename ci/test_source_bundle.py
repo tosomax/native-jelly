@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from source_bundle import (PRIVATE_KEY_PATTERN, SENTRY_DSN_PATTERN, canonical, digest, read_regular,
-                           snapshot, validate, write_archive)
+from source_bundle import (PRIVATE_KEY_PATTERN, SENTRY_DSN_PATTERN, allowed, canonical, digest,
+                           read_regular, snapshot, validate, write_archive)
 
 
 class BundleTests(unittest.TestCase):
@@ -65,6 +65,24 @@ class BundleTests(unittest.TestCase):
         first = self.path.read_bytes()
         self.write()
         self.assertEqual(first, self.path.read_bytes())
+
+    def test_platformfix_source_is_required_when_the_makefile_references_it(self):
+        self.contents['Makefile'] = (
+            b'PLATFORMFIX_SRC = interposer/platformfix.cpp\n'
+            b'all: $(PLATFORMFIX_SRC)\n', 0o644
+        )
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'missing platformfix source'):
+            self.check()
+        self.contents['interposer/platformfix.cpp'] = b'// interposer source fixture\n', 0o644
+        self.refresh()
+        self.check()
+
+    def test_interposer_sources_are_in_the_bundle_allowlist(self):
+        for name in ('interposer/platformfix.cpp', 'interposer/hosttest/run.sh',
+                     'interposer/hosttest/test.cpp', 'interposer/README.md'):
+            with self.subTest(name=name):
+                self.assertTrue(allowed(name), name)
 
     def test_missing_gpl(self):
         del self.contents['LICENSE']
@@ -403,7 +421,8 @@ class BundleTests(unittest.TestCase):
     def test_producer_keeps_package_and_host_check_inputs(self):
         repo, command = self.producer_fixture()
         required = ['licenses/retained.txt', '.claude/hooks/host-check.py',
-                    '.agents/skills/wake-tv/wake-tv.sh']
+                    '.agents/skills/wake-tv/wake-tv.sh', 'interposer/platformfix.cpp',
+                    'interposer/hosttest/run.sh', 'interposer/hosttest/test.cpp']
         for name in required:
             path = repo / name
             path.parent.mkdir(parents=True, exist_ok=True)

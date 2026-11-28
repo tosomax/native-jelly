@@ -712,6 +712,34 @@ RUST_LIB    = rust-modules/$(RUST_TDIR)/$(RUST_TARGET)/release/libnativejelly_mo
 SRCS = $(filter-out src/gpdebug.c src/ass.c,$(wildcard src/*.c)) src/compat/getauxval.c
 OBJS = $(SRCS:.c=.o)
 
+# --- libplatformfix.so: the o24n software-audio whitelist interposer (EXPERIMENT) ---------------
+# Debug install only and never a release build. The app loads it from its own install directory by
+# re-exec'ing once with LD_PRELOAD (`rust-modules/base/src/platformfix.rs`), and only the
+# `nativejelly-swdec` trigger arms that. A package without this file therefore cannot arm
+# anything, and nothing here is system-wide: no /etc/ld.so.preload, no library search path.
+#
+# These definitions MUST precede `all`: GNU Make expands a prerequisite list when it reads the
+# rule, not when it later updates targets. Defining PLATFORMFIX_FILES below `all` silently removed
+# the DSO from the default debug build (CI run 46155696814 built nativejelly but produced no DSO).
+PLATFORMFIX_SRC     = interposer/platformfix.cpp
+PLATFORMFIX_SO      = pkg/libplatformfix.so
+PLATFORMFIX_ALLOWED = $(if $(filter debug,$(FLAVOR)),$(if $(RELEASE),,yes),)
+PLATFORMFIX_FILES   = $(if $(filter yes,$(PLATFORMFIX_ALLOWED)),$(PLATFORMFIX_SO),)
+
+$(PLATFORMFIX_SO): $(PLATFORMFIX_SRC) Makefile ci/arm-cc.py ci/check-link-evidence.py
+	@mkdir -p pkg
+	NJ_ARM_CXX=1 $(CC) --sysroot=$(SYSROOT) -O2 -fPIC -shared -fno-omit-frame-pointer \
+	  -Wall -Wextra $(WERROR) -D_GLIBCXX_USE_CXX11_ABI=1 -o $@ $(PLATFORMFIX_SRC) -ldl
+
+# The named target must not bypass the same flavour/release fence as `all`, `ipk` and `deploy`.
+.PHONY: platformfix
+ifeq ($(PLATFORMFIX_ALLOWED),yes)
+platformfix: $(PLATFORMFIX_SO)
+else
+platformfix:
+	@echo "platformfix: refused -- requires FLAVOR=debug and an empty RELEASE" >&2; exit 1
+endif
+
 all: pkg/nativejelly pkg/nativejelly-storage $(PLATFORMFIX_FILES)
 
 # per-file compile; each object depends on ALL headers so a header edit rebuilds all, plus the
@@ -767,22 +795,6 @@ $(LIBASS_STAGED): $(LIBASS_INPUTS)
 	WEBOS_SDK=$(WEBOS_SDK) ./ci/build-libass.sh
 
 libass: $(LIBASS_STAGED)
-
-# --- libplatformfix.so: the o24n software-audio whitelist interposer (EXPERIMENT) ---------------
-# Debug install only and never a release build. The app loads it from its own install directory by
-# re-exec'ing once with LD_PRELOAD (`rust-modules/base/src/platformfix.rs`), and only the
-# `nativejelly-swdec` trigger arms that. A package without this file therefore cannot arm
-# anything, and nothing here is system-wide: no /etc/ld.so.preload, no library search path.
-PLATFORMFIX_SRC   = interposer/platformfix.cpp
-PLATFORMFIX_SO    = pkg/libplatformfix.so
-PLATFORMFIX_FILES = $(if $(filter debug,$(FLAVOR)),$(if $(RELEASE),,$(PLATFORMFIX_SO)),)
-
-$(PLATFORMFIX_SO): $(PLATFORMFIX_SRC) Makefile ci/arm-cc.py ci/check-link-evidence.py
-	@mkdir -p pkg
-	NJ_ARM_CXX=1 $(CC) --sysroot=$(SYSROOT) -O2 -fPIC -shared -fno-omit-frame-pointer \
-	  -Wall -Wextra $(WERROR) -D_GLIBCXX_USE_CXX11_ABI=1 -o $@ $(PLATFORMFIX_SRC) -ldl
-
-platformfix: $(PLATFORMFIX_SO)
 
 # Sentry Native supplies only the async-signal-safe capture and out-of-process ARM stack walk. Its
 # HTTP transport is compiled out: the resulting envelope is handed back to this executable in
@@ -1047,18 +1059,18 @@ APP_FILES = pkg/nativejelly $(SENTRY_HANDLER) $(APPINFO) $(ICONS) pkg/splash.png
             $(FFMPEG_STAGED) $(LIBASS_STAGED)
 
 # Everything `deploy` scp's as a PLAIN file, in one connection — the SAME set `ipk` stages via
-# `cp $(APP_FILES) $(STAGE)/`, minus the three entries that need their own handling for a reason
-# documented at each recipe rather than a plain copy: the binary and the crash handler (a running
-# process holds their inodes, so both go through a `.new` + `mv` dance), the bundled FFmpeg
-# libraries (their own retirement loop removes a superseded major after the copy), and the LAB
-# session file (a non-LAB deploy must actively REMOVE it, which a plain copy must never do to any
-# other entry). `filter-out` rather than a second hand-typed list is the whole fix: this recipe
+# `cp $(APP_FILES) $(STAGE)/`, minus the four entries that need their own handling for a reason
+# documented at each recipe rather than a plain copy: the binary, crash handler and interposer (a
+# running process may hold their inodes, so all three go through a `.new` + `mv` dance), the bundled
+# FFmpeg libraries (their own retirement loop removes a superseded major after the copy), and the
+# LAB session file (a non-LAB deploy must actively REMOVE it, which a plain copy must never do to
+# any other entry). `filter-out` rather than a second hand-typed list is the whole fix: this recipe
 # used to scp the binary, the handler, the appinfo and the fonts BY NAME, one line per file, while
 # `ipk` staged whatever `APP_FILES` said — so `pkg/splash.png`, both icon sizes, `pkg/OFL.txt` and
 # `THIRD-PARTY-NOTICES.md` were in every `.ipk` and in NO deployed app directory, silently, for as
 # long as nobody compared the two by hand. `ci/test_deploy_manifest.py` pins the relationship
 # itself (via `print-app-files`/`print-deploy-files`), not just today's four names.
-DEPLOY_FILES = $(filter-out pkg/nativejelly $(SENTRY_HANDLER) $(FFMPEG_STAGED) $(LAB_FILES),$(APP_FILES))
+DEPLOY_FILES = $(filter-out pkg/nativejelly $(SENTRY_HANDLER) $(PLATFORMFIX_SO) $(FFMPEG_STAGED) $(LAB_FILES),$(APP_FILES))
 
 # The subtitle faces (tools/cut-noto-subs.py): Noto Sans <script> Bold, one file per script, plus the
 # manifest that names them in add order. They are NOT in `APP_FILES`, because that list is staged
@@ -1136,6 +1148,14 @@ deploy: pkg/nativejelly pkg/nativejelly-storage $(FFMPEG_STAGED) $(SENTRY_NATIVE
 	# leaves the old process on its old inode while the next launch gets this one.
 	$(SCP) $(SENTRY_HANDLER) tv:$(APPDIR)/sentry-crash.new
 	$(SSH) 'chmod 755 $(APPDIR)/sentry-crash.new && mv $(APPDIR)/sentry-crash.new $(APPDIR)/sentry-crash'
+	# The preload interposer is mapped for the whole life of an armed app. Never scp over that inode:
+	# Linux refuses O_TRUNC on a mapped executable image (ETXTBSY). A sibling `.new` file plus rename
+	# replaces the directory entry atomically; existing processes keep the old inode, the next launch
+	# maps the new one. Empty for stable/nightly and every non-empty RELEASE, like the package itself.
+	@if [ -n "$(PLATFORMFIX_FILES)" ]; then \
+	  $(SCP) $(PLATFORMFIX_SO) tv:$(APPDIR)/libplatformfix.so.new && \
+	  $(SSH) 'chmod 644 $(APPDIR)/libplatformfix.so.new && mv $(APPDIR)/libplatformfix.so.new $(APPDIR)/libplatformfix.so'; \
+	fi
 	# The storage helper is a registered LS2 SERVICE, not part of the app directory — `ipk` has
 	# shipped it since the service existed (`ci/stage-link-evidence.py` into
 	# `usr/palm/services/$(APPID).storage/`), but `deploy` never had a path to it at all, so an
@@ -1205,9 +1225,9 @@ deploy: pkg/nativejelly pkg/nativejelly-storage $(FFMPEG_STAGED) $(SENTRY_NATIVE
 # `ci/verify-deploy.py`, which does the comparison (`md5 -q` on this Mac, matching busybox's hex
 # output) and fails loudly, naming every mismatch, rather than leaving a stale file for a bug
 # report to find weeks later. `VERIFY_FILES` is deliberately not `DEPLOY_FILES` alone: the binary,
-# the crash handler and the FFmpeg libraries take their own path to the device above and are just
-# as capable of silently drifting, so they are verified too.
-VERIFY_FILES = pkg/nativejelly $(SENTRY_HANDLER) $(FFMPEG_STAGED) $(DEPLOY_FILES) pkg/nativejelly-storage \
+# crash handler, interposer and FFmpeg libraries take their own path to the device above and are
+# just as capable of silently drifting, so they are verified too.
+VERIFY_FILES = pkg/nativejelly $(SENTRY_HANDLER) $(PLATFORMFIX_FILES) $(FFMPEG_STAGED) $(DEPLOY_FILES) pkg/nativejelly-storage \
                $(SUBS_FONT_FILES) $(if $(LAB),pkg/lab.json,)
 verify-deploy: tv-lock-require
 	@echo "verify-deploy: comparing $(words $(VERIFY_FILES)) files against $(APPID) [$(FLAVOR)]"
@@ -1616,6 +1636,9 @@ check-python: check-localization
 	@# comparison `verify-deploy` runs against the television, with no ssh and no device.
 	python3 ci/test_deploy_manifest.py
 	python3 ci/test_verify_deploy.py
+	python3 ci/test_arm_cc.py
+	python3 ci/test_platformfix.py
+	python3 ci/test_platformfix_elf.py
 	python3 ci/test_link_evidence.py
 	python3 ci/test_packaged_elf.py
 	python3 ci/test_check_elf.py

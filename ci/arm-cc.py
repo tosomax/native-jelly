@@ -12,11 +12,16 @@ import subprocess
 import sys
 
 
+def driver_for(cxx: str | None) -> str:
+    """Only the exact opt-in `1` may turn every C translation into C++."""
+    return 'arm-webos-linux-gnueabi-g++' if cxx == '1' else 'arm-webos-linux-gnueabi-gcc'
+
+
 def main():
     sdk = Path(os.environ.get('WEBOS_SDK', str(Path.home() / 'webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot')))
     # One wrapper for both drivers: the C++ object (interposer/platformfix.cpp) needs the same
     # link evidence as every shipped ELF, and g++ carries the SDK's sysroot/specs unchanged.
-    driver = 'arm-webos-linux-gnueabi-g++' if os.environ.get('NJ_ARM_CXX') else 'arm-webos-linux-gnueabi-gcc'
+    driver = driver_for(os.environ.get('NJ_ARM_CXX'))
     real = sdk / 'bin' / driver
     args = sys.argv[1:]
     linking = '-o' in args and not any(x in args for x in ('-c', '-S', '-E'))

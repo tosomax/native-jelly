@@ -344,6 +344,18 @@ jobs:
         # default that moves if the Makefile's does.
         run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
 
+      - name: Interposer host mechanism gate
+        # Compiles the x86_64 mock caller/stock library and the real interposer. It exercises the
+        # PLT preload path and every sentinel/kill-switch case; failure is a failed job, never a skip.
+        run: interposer/hosttest/run.sh
+
+      - name: Interposer DSO identity, symbol and version gate
+        # The host mechanism test cannot prove the ARM object. Check the actual artifact's ELF/ABI,
+        # exact exported definition and documented GLIBCXX ceiling before the firmware matrix.
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+        run: python3 ci/check-platformfix-elf.py pkg/libplatformfix.so
+
       - name: Binary size budget
         # The STRIPPED binary `make ipk` just staged (the one inside the .ipk), not the unstripped
         # pkg/nativejelly that deploys. `ls` of a glob rather than a literal appid so the flavour
@@ -436,7 +448,7 @@ jobs:
               --min-release 4.4.2 pkg/nativejelly-storage
             # The dlopen'd bundled FFmpeg: nothing above resolves its own DT_NEEDED (#235's
             # libz.so.1). Its sibling libraries ship in pkg/, so --shipped takes them off the list.
-            for lib in pkg/lib*-plx.so.*; do
+            for lib in pkg/lib*-plx.so.* pkg/libplatformfix.so; do
               case "$lib" in *.link.*) continue ;; esac   # the link-evidence sidecars
               ./tools/fwcompat.py --db /usr/share/webosbrew/compat-checker/data \
                 --min-release 4.4.2 --shipped pkg "$lib"

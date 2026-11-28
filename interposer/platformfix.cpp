@@ -28,8 +28,9 @@
 // mangled name differs, this definition is never called, and nothing crashes — a safe failure.
 //
 // Two safety gates beyond the trigger: the override applies only when the re-exec marker
-// `NJ_PLATFORMFIX_ACTIVE` is present (so an accidental system-wide preload is inert), and
-// `NJ_PLATFORMFIX=0` disables it. `NJ_PLATFORMFIX_DEBUG=1` prints one line per call to stderr.
+// `NJ_PLATFORMFIX_ACTIVE` is exactly `1` (so an accidental system-wide preload is inert), matching
+// Rust's anti-loop contract, and `NJ_PLATFORMFIX=0` disables it. `NJ_PLATFORMFIX_DEBUG=1` prints one
+// line per call to stderr. The marker is forgeable and is not an authentication mechanism.
 
 #include <dlfcn.h>
 
@@ -67,6 +68,11 @@ bool env_is_set_nonzero(const char* name) {
   return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
 }
 
+bool env_is_exact(const char* name, const char* expected) {
+  const char* v = std::getenv(name);
+  return v != nullptr && std::strcmp(v, expected) == 0;
+}
+
 // `NJ_PLATFORMFIX=0` -> everything stock.
 bool disabled_by_env() {
   const char* v = std::getenv("NJ_PLATFORMFIX");
@@ -75,7 +81,7 @@ bool disabled_by_env() {
 
 // Only the process the app re-exec'd with our library may answer `true`. An accidental preload
 // into some other process stays stock.
-bool override_armed() { return env_is_set_nonzero("NJ_PLATFORMFIX_ACTIVE"); }
+bool override_armed() { return env_is_exact("NJ_PLATFORMFIX_ACTIVE", "1"); }
 
 bool is_target(const std::string& p) {
   return p.size() == sizeof(kTarget) - 1 && std::memcmp(p.data(), kTarget, p.size()) == 0;

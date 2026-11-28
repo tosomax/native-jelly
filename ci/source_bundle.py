@@ -19,7 +19,7 @@ GPL_SHA256 = "fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0"
 ROOT_FILES = {'Makefile', 'LICENSE', 'LICENSING.md', 'THIRD-PARTY-NOTICES.md',
               'README.md', 'CONTRIBUTING.md', 'DCO', 'PRIVACY.md', 'SECURITY.md',
               'TRADEMARKS.md', '.gitignore', 'AGENTS.md', 'CLAUDE.md'}
-ROOT_DIRS = {'src', 'include', 'rust-modules', 'assets', 'ci', 'tools', 'docs', 'tests', 'licenses', 'locales', '.agents'}
+ROOT_DIRS = {'src', 'include', 'rust-modules', 'assets', 'ci', 'tools', 'docs', 'tests', 'licenses', 'locales', '.agents', 'interposer'}
 PKG_FILES = {'OFL.txt', 'appfont.ttf', 'appfont-bold.ttf', 'appfont-cjk.ttf',
              'appinfo.json', 'icon.png', 'icon160.png', 'icon320.png', 'icon400.png',
              'largeIcon.png', 'splash.png', 'telemetry.local.json.example'}
@@ -299,6 +299,13 @@ def validate(path, expected_snapshot=None, private_values=()):
         if re.search(rb'^\s*#\s*include\s*"ass_composite\.h"', contents['src/ass.c'], re.M):
             if 'src/ass_composite.h' not in contents:
                 fail('missing ASS renderer source: src/ass_composite.h')
+    makefile = contents['Makefile'].decode()
+    if 'PLATFORMFIX_SRC' in makefile:
+        source = re.search(r'^PLATFORMFIX_SRC\s*(?::=|=)\s*(\S+)', makefile, re.M)
+        if source is None:
+            fail('unresolved PLATFORMFIX_SRC in source Makefile')
+        if source.group(1) not in contents:
+            fail('missing platformfix source: ' + source.group(1))
     if 'ci/libass-dependencies.json' in contents:
         for required in json.loads(contents['ci/libass-dependencies.json']):
             if required['id'] not in ids:

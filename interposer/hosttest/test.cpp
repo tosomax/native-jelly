@@ -17,7 +17,7 @@ static void expect(const char* platform, bool want, const char* why) {
 
 int main() {
   const char* armed = std::getenv("NJ_PLATFORMFIX_ACTIVE");
-  const bool over = armed != nullptr && armed[0] != '\0' && std::string(armed) != "0";
+  const bool over = armed != nullptr && std::string(armed) == "1";
   const char* kill = std::getenv("NJ_PLATFORMFIX");
   const bool stock = kill != nullptr && std::string(kill) == "0";
 

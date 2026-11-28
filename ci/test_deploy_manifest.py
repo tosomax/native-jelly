@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """`make deploy` must ship exactly what `make ipk` stages, minus the entries that get their own
-handling for a documented reason (the binary + crash handler's `.new`+`mv` dance, the bundled
-FFmpeg libraries' own retirement loop, and the LAB session file's ship-or-remove rule).
+handling for a documented reason (the binary + crash handler + interposer's `.new`+`mv` dance, the
+bundled FFmpeg libraries' own retirement loop, and the LAB session file's ship-or-remove rule).
 
 This runs `make -s print-app-files` / `print-deploy-files` — two query targets that only echo a
 Makefile variable, exactly the pattern `docs/agent-reference.md` prescribes instead of `make -p`
@@ -34,18 +34,34 @@ def make_print(target: str, flavor: str = "debug") -> list[str]:
 
 
 class DeployManifest(unittest.TestCase):
-    def test_deploy_files_is_app_files_minus_the_three_carve_outs(self):
+    def test_deploy_files_is_app_files_minus_the_four_carve_outs(self):
         for flavor in ("debug", "stable"):
             with self.subTest(flavor=flavor):
                 app_files = make_print("print-app-files", flavor)
                 deploy_files = make_print("print-deploy-files", flavor)
                 handler_bin = make_print("print-sentry-handler", flavor)
                 ffmpeg_libs = make_print("print-ffmpeg-staged", flavor)
-                carve_outs = {"pkg/nativejelly", *handler_bin, *ffmpeg_libs}
+                carve_outs = {"pkg/nativejelly", "pkg/libplatformfix.so", *handler_bin, *ffmpeg_libs}
                 # LAB_FILES is empty unless LAB=1 is passed, and this test never sets it — so the
                 # session file never appears in either list here, and is asserted separately below.
                 expected = [f for f in app_files if f not in carve_outs]
                 self.assertEqual(deploy_files, expected)
+
+    def test_platformfix_dso_is_copied_to_a_new_inode_then_renamed_and_verified(self):
+        # A mapped DSO cannot be overwritten in place (ETXTBSY). This assertion is deliberately
+        # source-level so the regression is testable even in a lane forbidden to run make/build.
+        makefile = (ROOT / "Makefile").read_text()
+        deploy = next(line for line in makefile.splitlines() if line.startswith("DEPLOY_FILES ="))
+        self.assertIn("$(PLATFORMFIX_SO)", deploy)
+        verify = next(line for line in makefile.splitlines() if line.startswith("VERIFY_FILES ="))
+        self.assertIn("$(PLATFORMFIX_FILES)", verify)
+        self.assertIn("$(SCP) $(PLATFORMFIX_SO) tv:$(APPDIR)/libplatformfix.so.new", makefile)
+        self.assertIn(
+            "chmod 644 $(APPDIR)/libplatformfix.so.new && "
+            "mv $(APPDIR)/libplatformfix.so.new $(APPDIR)/libplatformfix.so",
+            makefile,
+        )
+        self.assertNotIn("$(SCP) $(DEPLOY_FILES) tv:$(APPDIR)/libplatformfix.so", makefile)
 
     def test_every_deploy_file_basename_is_unique(self):
         # `deploy` scp's the whole list to one directory in one connection; a basename collision

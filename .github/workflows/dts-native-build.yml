@@ -1,27 +1,29 @@
-name: v0.11.0 dtsinfo-fixed IPK
+name: DTS SWDEC debug IPK
 
 on:
   workflow_dispatch:
   push:
-    branches: [v011-dtsinfo-fixed]
+    branches: [dts-swdec-spike]
 
 permissions:
   contents: read
 
 concurrency:
-  group: v011-dtsinfo-fixed-${{ github.ref }}
+  group: dts-swdec-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   cross-build:
-    name: Build v0.11.0 dtsinfo-fixed IPK
+    name: Build DTS SWDEC debug IPK
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - name: Check out the experiment branch
+      - name: Check out the event commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: v011-dtsinfo-fixed
+          # The event SHA, not a moving branch name: the artifact and gates describe this push or
+          # manual dispatch even if the branch advances while the job is running.
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Install nightly Rust
@@ -36,13 +38,21 @@ jobs:
       - name: Package debug IPK
         run: make ipk FLAVOR=debug WEBOS_SDK='${{ steps.ndk.outputs.sdk-dir }}'
 
+      - name: Interposer host mechanism gate
+        run: interposer/hosttest/run.sh
+
+      - name: Interposer DSO identity, symbol and version gate
+        env:
+          WEBOS_SDK: ${{ steps.ndk.outputs.sdk-dir }}
+        run: python3 ci/check-platformfix-elf.py pkg/libplatformfix.so
+
       - name: Record package hash
         run: sha256sum pkg/*.ipk
 
       - name: Upload debug IPK
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: nativejelly-0.11.0-dtsinfo-fixed
+          name: nativejelly-dts-swdec-${{ github.sha }}
           path: pkg/*.ipk
           if-no-files-found: error
           retention-days: 30
