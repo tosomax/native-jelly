@@ -132,7 +132,11 @@ check('hook validates es=false and incomplete carrier caps', 'structure_get_bool
 check('hook preserves original CAPS on send refusal', 'if (!ok)' in hook and 'return PCMHD_PROBE_OK' in hook)
 check('hook balances pad refs and disarms', 's.object_ref(pad)' not in hook and 'void nj_pcmhd_disarm(void)' in hook)
 check('remove_probe has the public void ABI', 'typedef void (*remove_probe_fn)' in hook)
-check('hook sets pcm-multi-ch on the sink', '"pcm-multi-ch"' in hook)
+check('hook sets and verifies pcm-multi-ch through exported GObject functions',
+      'dlsym(gobj, "g_object_set")' in hook and 'dlsym(gobj, "g_object_get")' in hook
+      and 'pcm_multi_ch != 1' in hook)
+check('hook does not resolve non-exported GLib class macros',
+      'g_type_instance_get_class' not in hook and 'g_object_class_find_property' not in hook)
 check('hook is inert without the armed flag', '!nj_pcmhd_armed_load()' in hook)
 
 check('Makefile exports the factory hook only with devtriggers',

@@ -3992,7 +3992,8 @@ fn dts_core_timing(core: &[u8]) -> Option<crate::player::es_carrier::DtsTiming> 
     if (header[4] >> 2) & 0x1f != 31 {
         return None;
     }
-    let blocks = (((u16::from(header[4]) << 8) | u16::from(header[5])) >> 2 & 0x7f) + 1;
+    // NBLKS spans byte 4 bit 0 (the high bit) and byte 5 bits 7..2 (the low six bits).
+    let blocks = ((u16::from(header[4] & 0x01) << 6) | (u16::from(header[5]) >> 2)) + 1;
     const RATES: [u32; 16] = [0, 8_000, 16_000, 32_000, 0, 0, 11_025, 22_050, 44_100, 0, 0, 12_000, 24_000, 48_000, 96_000, 192_000];
     let sample_rate = *RATES.get(usize::from((header[8] >> 2) & 0x0f))?;
     (sample_rate != 0).then_some(DtsTiming { sample_rate, blocks })
@@ -4077,10 +4078,17 @@ mod dts_core_tests {
         frame
     }
 
+    fn set_blocks(frame: &mut [u8], blocks: u16) {
+        assert!((1..=128).contains(&blocks));
+        let encoded = blocks - 1;
+        frame[4] = (frame[4] & !0x01) | ((encoded >> 6) as u8);
+        frame[5] = (frame[5] & 0x03) | (((encoded & 0x3f) << 2) as u8);
+    }
+
     #[test]
     fn timing_reads_rate_and_blocks_and_rejects_reserved_or_nonstandard_headers() {
         let mut frame = core();
-        frame[5] = 0x3c; // NBLKS=15 -> 16 blocks
+        set_blocks(&mut frame, 16);
         frame[8] = 13 << 2;
         let timing = dts_core_timing(&frame).unwrap();
         assert_eq!((timing.sample_rate, timing.blocks), (48_000, 16));
@@ -4095,10 +4103,14 @@ mod dts_core_tests {
         frame[4] = 0xbc; // NBLKS=15 -> 16 blocks, but DEFSIC is not a full 32-sample block
         assert!(dts_core_timing(&frame).is_none());
         frame[4] = 0xfc;
-        frame[5] = 17; // NBLKS=17 -> 18 blocks
+        set_blocks(&mut frame, 18); // encoded 17: high bit in byte 4, low six bits in byte 5
         let timing = dts_core_timing(&frame).unwrap();
         assert_eq!(timing.blocks, 18);
         assert!(!timing.supported());
+        set_blocks(&mut frame, 1);
+        assert_eq!(dts_core_timing(&frame).unwrap().blocks, 1);
+        set_blocks(&mut frame, 128);
+        assert_eq!(dts_core_timing(&frame).unwrap().blocks, 128);
         frame[8] = 0; // reserved SFCODE
         assert!(dts_core_timing(&frame).is_none());
     }

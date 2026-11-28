@@ -10,7 +10,8 @@
  *   - Built/exported only with the Rust `devtriggers` feature (see Makefile).
  *   - Disarmed calls resolve only the real gst_element_factory_make and forward it. No probe symbol
  *     is required, so an unrelated GStreamer pipeline cannot be broken by this diagnostic.
- *   - Event/probe/GObject access uses public GStreamer/GObject functions, not donor struct offsets.
+ *   - Event/probe access uses public GStreamer functions; the sink property is verified through
+ *     exported GObject set/get functions, not donor struct offsets or non-exported GLib macros.
  *   - Rust does not feed a carrier chunk until this probe reports accepted carrier CAPS. Missing
  *     interposition, unexpected caps, a missing property, or a rejected replacement all fail closed.
  *
@@ -80,10 +81,8 @@ typedef const char *(*structure_get_string_fn)(const GstStructure *, const char 
 typedef int (*structure_get_boolean_fn)(const GstStructure *, const char *, int *);
 typedef void (*mini_object_unref_fn)(void *);
 typedef void (*object_unref_fn)(void *);
-typedef void *(*object_class_find_property_fn)(void *, const char *);
 typedef void (*g_object_set_fn)(void *, const char *, ...);
-typedef unsigned long (*g_type_from_name_fn)(const char *);
-typedef void *(*g_type_instance_get_class_fn)(void *, unsigned long);
+typedef void (*g_object_get_fn)(void *, const char *, ...);
 
 struct syms {
   int make_ready;
@@ -108,10 +107,8 @@ struct syms {
   structure_get_boolean_fn structure_get_boolean;
   mini_object_unref_fn mini_object_unref;
   object_unref_fn object_unref;
-  object_class_find_property_fn class_find_property;
   g_object_set_fn g_object_set;
-  g_type_from_name_fn g_type_from_name;
-  g_type_instance_get_class_fn g_type_instance_get_class;
+  g_object_get_fn g_object_get;
 };
 
 static struct syms s;
@@ -215,12 +212,10 @@ static int resolve_probe_locked(void) {
   SYM(mini_object_unref, "gst_mini_object_unref");
   SYM(object_unref, "gst_object_unref");
 #undef SYM
-  *(void **)(&s.class_find_property) = dlsym(gobj, "g_object_class_find_property");
   *(void **)(&s.g_object_set) = dlsym(gobj, "g_object_set");
-  *(void **)(&s.g_type_from_name) = dlsym(gobj, "g_type_from_name");
-  *(void **)(&s.g_type_instance_get_class) = dlsym(gobj, "g_type_instance_get_class");
-  if (!s.class_find_property || !s.g_object_set || !s.g_type_from_name || !s.g_type_instance_get_class) {
-    sink_log("NOT ARMED: libgobject lacks public class/property functions");
+  *(void **)(&s.g_object_get) = dlsym(gobj, "g_object_get");
+  if (!s.g_object_set || !s.g_object_get) {
+    sink_log("NOT ARMED: libgobject lacks public property set/get functions");
     return 0;
   }
   s.probe_ready = 1;
@@ -374,18 +369,21 @@ static void install_locked(GstElement *sink, uint64_t session) {
     refuse_carrier(session, "gst_pad_add_probe failed");
     return;
   }
-  unsigned long gobject_type = s.g_type_from_name("GObject");
-  void *class = gobject_type ? s.g_type_instance_get_class(sink, gobject_type) : 0;
-  if (!class || !s.class_find_property(class, "pcm-multi-ch")) {
+  /* G_OBJECT_GET_CLASS/G_TYPE_INSTANCE_GET_CLASS are macros, not exported functions. Verify the
+   * property through the public varargs set/get ABI instead; a missing or write-only property
+   * leaves the sentinel unchanged and fails closed. GLib may log a warning for a missing name. */
+  int pcm_multi_ch = -1;
+  s.g_object_set(sink, "pcm-multi-ch", 1, 0);
+  s.g_object_get(sink, "pcm-multi-ch", &pcm_multi_ch, 0);
+  if (pcm_multi_ch != 1) {
     s.remove_probe(pad, probe_id);
     s.object_unref(pad);
     probe_pad = 0;
     probe_id = 0;
-    refuse_carrier(session, "audiosink has no pcm-multi-ch property");
+    refuse_carrier(session, "audiosink pcm-multi-ch set/get round trip did not return true");
     return;
   }
-  s.g_object_set(sink, "pcm-multi-ch", 1, 0);
-  sink_log("session=%llu audiosink found: probe %lu on sink pad, pcm-multi-ch requested",
+  sink_log("session=%llu audiosink found: probe %lu on sink pad, pcm-multi-ch set/get verified",
            (unsigned long long)session, probe_id);
 }
 

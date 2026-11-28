@@ -86,7 +86,8 @@ La revisione non legge più `GstPadProbeInfo.data` o `GstEvent.type` a offset ha
 
 - `gst_pad_probe_info_get_event()`;
 - `gst_event_get_type()` + `gst_event_type_get_name()` (nessun valore enum numerico);
-- `g_type_from_name()` + `g_type_instance_get_class()` per la classe GObject;
+- `g_object_set()` + `g_object_get()` per impostare e verificare `pcm-multi-ch`; le macro
+  `G_OBJECT_GET_CLASS`/`G_TYPE_INSTANCE_GET_CLASS` non sono simboli esportati e non vengono risolte;
 - `gst_structure_get_boolean/int/uint/uint64/string()` per validare i campi;
 - `gst_pad_remove_probe()` con il prototipo pubblico `void`.
 

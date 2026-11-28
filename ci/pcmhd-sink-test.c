@@ -57,7 +57,6 @@ struct GstElement {
   int property;
   int has_property;
   GstPad pad;
-  int klass;
 };
 
 /* Deliberately only one pointer at offset zero. The old info+8 ABI guess would read garbage. */
@@ -70,6 +69,8 @@ static GstElement replacement_element;
 static GstStructure carrier_structure;
 static GstCaps carrier_caps;
 static GstEvent replacement_event;
+/* Arbitrary on purpose: the hook must ask gst_event_type_get_name(), not compare a donor enum. */
+#define FAKE_CAPS_EVENT_TYPE 777
 static int armed;
 static uint64_t session;
 static int ready_calls;
@@ -132,7 +133,7 @@ static int fake_send_event(GstPad *pad, GstEvent *event) {
 }
 
 static GstEvent *fake_event_new_caps(GstCaps *caps) {
-  replacement_event.type = 777; /* Intentionally not the donor's numeric GST_EVENT_CAPS. */
+  replacement_event.type = FAKE_CAPS_EVENT_TYPE;
   replacement_event.caps = caps;
   return &replacement_event;
 }
@@ -140,7 +141,7 @@ static GstEvent *fake_event_new_caps(GstCaps *caps) {
 static void fake_event_parse_caps(GstEvent *event, GstCaps **caps) { *caps = event->caps; }
 static GstEvent *fake_probe_info_get_event(GstPadProbeInfo *info) { return ((FakeProbeInfo *)info)->event; }
 static int fake_event_get_type(const GstEvent *event) { return event->type; }
-static const char *fake_event_type_get_name(int type) { return type == 777 ? "caps" : "other"; }
+static const char *fake_event_type_get_name(int type) { return type == FAKE_CAPS_EVENT_TYPE ? "caps" : "other"; }
 static GstCaps *fake_caps_from_string(const char *caps) { assert(!strcmp(caps, PCMHD_CAPS)); return &carrier_caps; }
 static GstStructure *fake_caps_get_structure(const GstCaps *caps, unsigned int index) { return index == 0 ? caps->structure : 0; }
 static const char *fake_structure_get_name(const GstStructure *st) { return st->name; }
@@ -187,23 +188,27 @@ static void fake_object_unref(void *object) {
   assert(pad->refs > 0);
   pad->refs--;
 }
-static void *fake_class_find_property(void *klass, const char *property) {
-  GstElement *sink = klass;
-  return !strcmp(property, "pcm-multi-ch") && sink->has_property ? sink : 0;
-}
 static void fake_g_object_set(void *object, const char *property, ...) {
   GstElement *sink = object;
   va_list args;
   assert(!strcmp(property, "pcm-multi-ch"));
   va_start(args, property);
-  sink->property = va_arg(args, int);
+  int value = va_arg(args, int);
   (void)va_arg(args, int); /* documented varargs terminator */
   va_end(args);
+  if (sink->has_property)
+    sink->property = value;
 }
-static unsigned long fake_g_type_from_name(const char *name) { return !strcmp(name, "GObject") ? 1 : 0; }
-static void *fake_g_type_instance_get_class(void *instance, unsigned long type) {
-  assert(type == 1);
-  return instance;
+static void fake_g_object_get(void *object, const char *property, ...) {
+  GstElement *sink = object;
+  va_list args;
+  assert(!strcmp(property, "pcm-multi-ch"));
+  va_start(args, property);
+  int *value = va_arg(args, int *);
+  (void)va_arg(args, int); /* documented varargs terminator */
+  va_end(args);
+  if (sink->has_property)
+    *value = sink->property;
 }
 
 void *__wrap_dlopen(const char *soname, int flags) {
@@ -215,6 +220,8 @@ void *__wrap_dlopen(const char *soname, int flags) {
 void *__wrap_dlsym(void *handle, const char *name) {
   (void)handle;
   if (!strcmp(name, "gst_element_factory_make")) return make_missing ? 0 : (void *)fake_make;
+  /* GLib exposes G_TYPE_INSTANCE_GET_CLASS as a macro, not an exported function. */
+  if (!strcmp(name, "g_type_instance_get_class")) return 0;
   if (probe_symbols_missing) return 0;
 #define SYM(symbol, function) if (!strcmp(name, symbol)) return (void *)function
   SYM("gst_element_get_static_pad", fake_get_static_pad);
@@ -236,10 +243,8 @@ void *__wrap_dlsym(void *handle, const char *name) {
   SYM("gst_structure_get_boolean", fake_structure_get_boolean);
   SYM("gst_mini_object_unref", fake_mini_object_unref);
   SYM("gst_object_unref", fake_object_unref);
-  SYM("g_object_class_find_property", fake_class_find_property);
   SYM("g_object_set", fake_g_object_set);
-  SYM("g_type_from_name", fake_g_type_from_name);
-  SYM("g_type_instance_get_class", fake_g_type_instance_get_class);
+  SYM("g_object_get", fake_g_object_get);
 #undef SYM
   return 0;
 }
@@ -296,10 +301,20 @@ static int install_for_test(void) {
 
 static int invoke_caps(GstStructure *st) {
   GstCaps caps = { st };
-  GstEvent event = { 12345, &caps };
+  GstEvent event = { FAKE_CAPS_EVENT_TYPE, &caps };
   FakeProbeInfo info = { &event };
   assert(probe_pad && probe_pad->callback);
   return probe_pad->callback(probe_pad, &info, probe_pad->user);
+}
+
+static void expect_caps(int expected, GstStructure *st, const char *what) {
+  int got = invoke_caps(st);
+  if (got != expected) {
+    fprintf(stderr,
+            "CAPS case '%s': got=%d expected=%d armed=%d ready=%d refused=%d sends=%d event_type=%d\n",
+            what, got, expected, armed, ready_calls, refused_calls, send_calls, FAKE_CAPS_EVENT_TYPE);
+  }
+  assert(got == expected);
 }
 
 static void test_disarmed_and_non_audio_need_only_real_make(void) {
@@ -351,7 +366,9 @@ static void test_caps_false_absent_nonboolean_incomplete_and_complete(void) {
     install_for_test();
     GstStructure st;
     base_caps(&st, es_values[i]);
-    assert(invoke_caps(&st) == PCMHD_PROBE_DROP);
+    char what[64];
+    snprintf(what, sizeof(what), "es fixture %d", es_values[i]);
+    expect_caps(PCMHD_PROBE_DROP, &st, what);
     assert(send_calls == 1 && ready_calls == 1 && refused_calls == 0);
     assert(last_sent == &replacement_event && last_sent->caps == &carrier_caps);
     assert(nested_return == PCMHD_PROBE_OK); /* nested carrier CAPS must pass through */
@@ -363,7 +380,7 @@ static void test_caps_false_absent_nonboolean_incomplete_and_complete(void) {
   GstStructure incomplete;
   base_caps(&incomplete, 1);
   incomplete.data_bps = 8; /* es=true but incomplete: still rewrite */
-  assert(invoke_caps(&incomplete) == PCMHD_PROBE_DROP);
+  expect_caps(PCMHD_PROBE_DROP, &incomplete, "es=true but incomplete carrier fields");
   assert(send_calls == 1 && ready_calls == 1 && refused_calls == 0);
   nj_pcmhd_disarm();
 
@@ -371,7 +388,7 @@ static void test_caps_false_absent_nonboolean_incomplete_and_complete(void) {
   install_for_test();
   GstStructure complete;
   base_caps(&complete, 1);
-  assert(invoke_caps(&complete) == PCMHD_PROBE_OK);
+  expect_caps(PCMHD_PROBE_OK, &complete, "complete carrier bypass");
   assert(send_calls == 0 && ready_calls == 1 && refused_calls == 0);
   nj_pcmhd_disarm();
 }
@@ -382,7 +399,7 @@ static void test_rejected_replacement_preserves_original_and_refuses_feed(void) 
   send_result = 0;
   GstStructure st;
   base_caps(&st, 0);
-  assert(invoke_caps(&st) == PCMHD_PROBE_OK); /* the original CAPS must not be dropped */
+  expect_caps(PCMHD_PROBE_OK, &st, "rejected replacement preserves original");
   assert(send_calls == 1 && refused_calls == 1 && ready_calls == 0 && armed == 0);
   nj_pcmhd_disarm();
 }
@@ -400,7 +417,7 @@ static void test_missing_property_and_unexpected_caps_refuse_feed(void) {
   base_caps(&st, 0);
   st.rate = 48000;
   st.channels = 2;
-  assert(invoke_caps(&st) == PCMHD_PROBE_OK);
+  expect_caps(PCMHD_PROBE_OK, &st, "unexpected negotiated shape refuses feed");
   assert(refused_calls == 1 && ready_calls == 0 && armed == 0 && send_calls == 0);
   nj_pcmhd_disarm();
 }

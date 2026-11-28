@@ -43,9 +43,10 @@ producono un rifiuto, non un fallback PCM rumoroso.
   packer accetta solo 48000/16 blocchi. Se presente, `AVPacket.duration` deve corrispondere a 512
   campioni a 48 kHz. Ogni altra shape è rifiutata.
 - **P1-6 — ABI pubblico.** Rimossi gli offset `info+8` e `event+36` e il valore enum numerico. Usate
-  `gst_pad_probe_info_get_event`, `gst_event_get_type`, `gst_event_type_get_name`,
-  `g_type_from_name` e `g_type_instance_get_class`. Il comportamento del sink LG resta non provato,
-  ma il codice non dipende più dal layout donor.
+  `gst_pad_probe_info_get_event`, `gst_event_get_type`, `gst_event_type_get_name` e le funzioni
+  esportate `g_object_set`/`g_object_get` per verificare `pcm-multi-ch`. La macro GLib
+  `g_type_instance_get_class` non viene risolta. Il comportamento del sink LG resta non provato, ma
+  il codice non dipende più dal layout donor né da simboli non esportati.
 
 ### P2
 
@@ -154,9 +155,10 @@ Comando registrato in `ci/test-pcmhd-sink.sh`; **non eseguito**.
   già `-D_GNU_SOURCE`. Corretto con guard `#ifndef`; la scansione ha trovato lo stesso define non
   guardato in `ci/test-compat-auxv.c` e lo ha anch'esso reso idempotente. Scansione statica delle
   macro `-D` del Makefile (`_GNU_SOURCE`, `NJ_DEBUG`) contro tutti i C: **nessun conflitto residuo**.
-- `python3 ci/test_check_elf.py` — **21 test OK**.
+- `python3 ci/test_check_elf.py` — **22 test OK**.
 - `python3 docs/agent-reports/verify-pcmhd-carrier.py --tree-only` — **0 fail**.
-- Controllo statico una-tantum dei 24 simboli risolti: tutti hanno un fake nell'harness C.
+- Controllo statico una-tantum dei 22 simboli risolti (21 fake + il real `make`): parità completa,
+  nessun fake per macro GLib non esportate.
 - `git diff --check` — **OK**.
 - Verifica dei letterali `CarriedAudio`: nessuno privo del nuovo `sample_rate` o di update.
 
@@ -171,3 +173,47 @@ Comando registrato in `ci/test-pcmhd-sink.sh`; **non eseguito**.
 - Restano non provati: callsite effettivo di libpf, hash/build del sink 33.31.68, parsing LG delle
   caps, negoziazione 192k/8ch e riproduzione AVR. Il percorso non è dichiarato verificato o
   deployabile; in loro assenza l'handshake impedisce il feed.
+
+## Follow-up CI host — run 46156913622 / 46157136447
+
+Base del follow-up: `dc6dda96`.
+
+### Due regressioni Rust
+
+- **NBLKS:** il fixture scriveva `frame[5]=17`, che codifica 5 blocchi perché il bit alto di NBLKS
+  sta nel bit 0 di `frame[4]`. La formula del parser era corretta. Resa esplicita la lettura
+  `byte4 bit0 + byte5 bits7..2` e aggiunto `set_blocks()`, che codifica correttamente 1/16/18/128.
+- **PTS:** il fixture chiamava "jitter" un gruppo posto ~10 ms dopo la lattice; il re-anchor a
+  `72_000_500` era quindi corretto. Ricostruiti i timestamp da `FRAME_NS`: +0.5 ms viene smoothed,
+  +50 ms riancora immediatamente.
+
+Nessuna soglia fail-closed è stata allentata.
+
+### Simbolo GLib non esportato
+
+La check indipendente `/tmp/opencode/pcm-fix-check/report.md` ha trovato
+`dlsym("g_type_instance_get_class")`, che è una macro e non un simbolo. Rimosso insieme a
+`g_type_from_name`/`g_object_class_find_property`. La proprietà è ora impostata con
+`g_object_set()` e verificata con `g_object_get()`; sentinel `-1` e round-trip diverso da `1`
+rifiutano il carrier. L'harness non finge più quei simboli e restituisce esplicitamente `NULL`
+per la macro. Aggiunto un gate statico di parità tra simboli risolti e fake.
+
+### Harness C runtime
+
+La run `46157136447` falliva perché l'evento originale del fixture aveva tipo `12345`, mentre il
+fake restituiva il nome `"caps"` solo per `777`; la probe passava correttamente un non-CAPS.
+Unificato `FAKE_CAPS_EVENT_TYPE` per originale e sostitutivo e aggiunto `expect_caps()` con stampa
+di got/expected, armed/ready/refused/sends. Il contratto della probe non è stato modificato.
+
+### Verifiche del follow-up
+
+- Modello statico dei fixture NBLKS: round-trip 1/16/18/128.
+- Modello statico del packer: output `[10, 32000010, 114000010]`.
+- `nm -D` sulla GLib host: `g_object_get` e `g_object_set` esportate;
+  `g_type_instance_get_class` assente (coerente con la macro GLib).
+- Gate Python dei contratti C/Rust e parità simboli/fake.
+- `git diff --check`.
+
+Non eseguiti localmente: test Rust, compilazione/esecuzione harness C, cargo/make/build, ARM, TV o
+Docker. La CI ha eseguito le versioni precedenti di quei test e ha prodotto i log citati; la
+presente patch non è stata rieseguita in questa lane.

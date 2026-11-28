@@ -954,17 +954,17 @@ mod tests {
         assert_eq!(p.frame(&frame, 0, 10), Ok(None));
         assert_eq!(p.frame(&frame, 0, 20), Ok(None));
         assert_eq!(p.frame(&frame, 0, 30), Ok(Some(10)));
-        // Half a millisecond of rounding is smoothed; a real 50 ms gap is not.
-        for t in [42_000_500, 52_000_500, 62_000_500] {
-            p.frame(&frame, 0, t).ok();
-        }
-        assert_eq!(p.frame(&frame, 0, 72_000_500).ok(), Some(None));
-        assert_eq!(p.frame(&frame, 0, 82_000_500).ok(), Some(None));
-        assert_eq!(p.frame(&frame, 0, 92_000_500), Ok(Some(42_000_010)));
-        for t in [142_000_500, 152_000_500] {
-            p.frame(&frame, 0, t).ok();
-        }
-        assert_eq!(p.frame(&frame, 0, 162_000_500), Ok(Some(142_000_500)));
+        let next = 10 + super::FRAME_NS;
+        let jittered = next + 500_000;
+        // Half a millisecond of rounding is smoothed...
+        assert_eq!(p.frame(&frame, 0, jittered), Ok(None));
+        assert_eq!(p.frame(&frame, 0, jittered + 10_000_000), Ok(None));
+        assert_eq!(p.frame(&frame, 0, jittered + 20_000_000), Ok(Some(next)));
+        // ...while a real 50 ms gap re-anchors immediately.
+        let gap = next + super::FRAME_NS + 50_000_000;
+        assert_eq!(p.frame(&frame, 0, gap), Ok(None));
+        assert_eq!(p.frame(&frame, 0, gap + 10_000_000), Ok(None));
+        assert_eq!(p.frame(&frame, 0, gap + 20_000_000), Ok(Some(gap)));
         let q = super::QUEUE.lock().unwrap();
         assert_eq!(q.back().map(|c| c.iter().map(|(_, v)| v.len()).sum::<usize>()), Some(3 * (20 + 100)));
     }
