@@ -59,7 +59,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 ci/test_platformfix.py
   -> 8 test OK
 
 PYTHONDONTWRITEBYTECODE=1 python3 ci/test_platformfix_elf.py
-  -> 8 test OK (readelf fittizio)
+  -> 11 test OK (readelf fittizio, anche colonne extra e suffisso @versione)
 
 PYTHONDONTWRITEBYTECODE=1 python3 ci/test_deploy_manifest.py -k platformfix_dso
   -> 1 test OK (solo il caso statico; il resto invocherebbe make)

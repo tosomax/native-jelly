@@ -3,9 +3,9 @@
 
 The host mechanism test proves preload/PLT behaviour on the host architecture. This proves
 different facts about the shipped ARM object: ELF32/ARMv7 soft-float identity, the one exact
-unversioned GLOBAL/DEFAULT C++ definition, a deliberately small system-library dependency set,
-and no C++ runtime symbol version above the documented webOS 4.4.2 floor. It does not prove the
-TV's real symbol or playback.
+mangled GLOBAL/DEFAULT C++ definition (a `@version` suffix is tolerated), a deliberately small
+system-library dependency set, and no C++ runtime symbol version above the documented webOS
+4.4.2 floor. It does not prove the TV's real symbol or playback.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ import subprocess
 import sys
 
 SYMBOL = "_ZN3smp4util37isPlatformSupportSoftwareAudioDecoderENSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE"
+CANDIDATE = "isPlatformSupportSoftwareAudioDecoder"
+_VERSION_INDEX = re.compile(r"^\(\d+\)$")
 REQUIRED_NEEDED = {"libc.so.6"}
 ALLOWED_NEEDED = REQUIRED_NEEDED | {"libdl.so.2", "libgcc_s.so.1", "libm.so.6", "libstdc++.so.6"}
 # The documented C++ ABI floor is GLIBCXX_3.4.21. The exact cxx11 mangled name above already
@@ -31,9 +33,23 @@ class GateError(ValueError):
     pass
 
 
-def query(readelf: str, binary: Path, option: str) -> str:
-    result = subprocess.run([readelf, option, str(binary)], check=True, capture_output=True, text=True)
+def query(readelf: str, binary: Path, option: str | list[str]) -> str:
+    options = [option] if isinstance(option, str) else option
+    result = subprocess.run([readelf, *options, str(binary)], check=True, capture_output=True,
+                            text=True)
     return result.stdout
+
+
+def dynsym_fields(line: str) -> list[str]:
+    """A .dynsym row's fields; readelf may append a separate version index like `(2)`."""
+    fields = line.split()
+    if fields and _VERSION_INDEX.fullmatch(fields[-1]):
+        fields = fields[:-1]
+    return fields
+
+
+def candidate_rows(symbols: str) -> str:
+    return "\n".join(line for line in symbols.splitlines() if CANDIDATE in line) or "(none)"
 
 
 def version_key(name: str) -> tuple[int, ...] | None:
@@ -63,17 +79,26 @@ def check(binary: Path, readelf: str) -> None:
     if not re.search(r"Tag_CPU_arch:\s+v7", attributes):
         raise GateError("not ARMv7 (Tag_CPU_arch)")
 
-    symbols = query(readelf, binary, "--dyn-syms")
+    # -W keeps long C++ names on one row; read from the right edge so extra/renamed columns do not
+    # shift Type/Bind/Vis/Ndx. Only a `@...` version suffix may follow the exact mangled name.
+    symbols = query(readelf, binary, ["-W", "--dyn-syms"])
     rows = []
     for line in symbols.splitlines():
-        fields = line.split()
-        if len(fields) >= 8 and fields[0].endswith(":") and fields[7] == SYMBOL:
-            rows.append(fields)
+        fields = dynsym_fields(line)
+        if len(fields) >= 5 and fields[-1].split("@", 1)[0] == SYMBOL:
+            rows.append((fields, line))
     if len(rows) != 1:
-        raise GateError(f"exact interposer symbol must occur once in .dynsym, found {len(rows)}")
-    fields = rows[0]
-    if fields[3] != "FUNC" or fields[4] != "GLOBAL" or fields[5] != "DEFAULT" or fields[6] == "UND":
-        raise GateError("interposer symbol is not a defined GLOBAL/DEFAULT FUNC")
+        raise GateError(
+            f"exact interposer symbol must occur once in .dynsym, found {len(rows)}\n"
+            f"  candidate rows: {candidate_rows(symbols)}"
+        )
+    fields, line = rows[0]
+    if (fields[-5] != "FUNC" or fields[-4] != "GLOBAL" or fields[-3] != "DEFAULT"
+            or fields[-2] == "UND"):
+        raise GateError(
+            "interposer symbol is not a defined GLOBAL/DEFAULT FUNC\n"
+            f"  row read: {line}"
+        )
 
     dynamic = query(readelf, binary, "-d")
     needed = set(re.findall(r"\(NEEDED\).*?Shared library:\s+\[([^\]]+)\]", dynamic))
@@ -104,7 +129,7 @@ def check(binary: Path, readelf: str) -> None:
         raise GateError("C++ runtime versions exceed the supported floor: " + ", ".join(too_new))
 
     print("platformfix ELF: ELF32 / ARMv7 / soft-float / ET_DYN")
-    print("platformfix symbol: exact unversioned GLOBAL/DEFAULT FUNC")
+    print("platformfix symbol: exact mangled GLOBAL/DEFAULT FUNC")
     print("platformfix DT_NEEDED: " + ", ".join(sorted(needed)))
     print("platformfix C++ versions: " + (", ".join(versions) if versions else "none required"))
 

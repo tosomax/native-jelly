@@ -41,9 +41,10 @@ class ArtifactGate(unittest.TestCase):
         values = outputs() if spec is None else spec
 
         def fake_query(_readelf, _binary, option):
-            if query_error is not None and option == query_error:
-                raise subprocess.CalledProcessError(7, ["readelf", option])
-            return values[option]
+            key = option[-1] if isinstance(option, list) else option
+            if query_error is not None and key == query_error:
+                raise subprocess.CalledProcessError(7, ["readelf", key])
+            return values[key]
 
         with patch.object(gate, "query", side_effect=fake_query):
             return gate.check(self.binary, "readelf")
@@ -76,7 +77,7 @@ class ArtifactGate(unittest.TestCase):
             good.replace("GLOBAL", "WEAK"),
             good.replace("DEFAULT", "HIDDEN"),
             good.replace("FUNC", "OBJECT"),
-            good.replace(gate.SYMBOL, gate.SYMBOL + "@GLIBCXX_3.4.21"),
+            good.replace(gate.SYMBOL, gate.SYMBOL + "Extra@GLIBCXX_3.4.21 (2)"),
         ]
         for rows in cases:
             with self.subTest(rows=rows):
@@ -84,6 +85,49 @@ class ArtifactGate(unittest.TestCase):
                 spec["--dyn-syms"] = rows + "\n"
                 with self.assertRaisesRegex(gate.GateError, "symbol"):
                     self.run_gate(spec)
+
+    def test_extra_columns_and_version_suffix_are_parsed(self):
+        good = outputs()["--dyn-syms"].strip()
+        variants = (
+            good.replace("64 FUNC", "64 7 FUNC"),  # extra column before Type
+            good.replace(gate.SYMBOL, gate.SYMBOL + "@GLIBCXX_3.4.21"),
+            good.replace(gate.SYMBOL, gate.SYMBOL + "@GLIBCXX_3.4.21 (2)"),
+            good.replace(gate.SYMBOL, "  " + gate.SYMBOL + "@GLIBCXX_3.4.21 (2)"),
+        )
+        for rows in variants:
+            with self.subTest(rows=rows):
+                spec = outputs()
+                spec["--dyn-syms"] = (
+                    "Symbol table '.dynsym' contains 5 entries:\n"
+                    "   Num:    Value          Size Type    Bind   Vis      Ndx Name\n"
+                    + rows + "\n"
+                )
+                self.run_gate(spec)
+
+    def test_symbol_failures_report_the_candidate_rows(self):
+        good = outputs()["--dyn-syms"].strip()
+        for rows, expected in (
+            ("", "candidate rows: (none)"),
+            (good + "\n" + good, gate.SYMBOL),
+            (good.replace("DEFAULT", "HIDDEN"), "row read:"),
+        ):
+            with self.subTest(expected=expected):
+                spec = outputs()
+                spec["--dyn-syms"] = rows + "\n"
+                with self.assertRaises(gate.GateError) as caught:
+                    self.run_gate(spec)
+                self.assertIn(expected, str(caught.exception))
+
+    def test_dynsym_query_is_wide(self):
+        seen = []
+
+        def fake_query(_readelf, _binary, option):
+            seen.append(option)
+            return outputs()[option[-1] if isinstance(option, list) else option]
+
+        with patch.object(gate, "query", side_effect=fake_query):
+            gate.check(self.binary, "readelf")
+        self.assertIn(["-W", "--dyn-syms"], seen)
 
     def test_dt_needed_cannot_link_lg_or_drop_libc(self):
         for needed, message in (("0x1 (NEEDED) Shared library: [libstdc++.so.6]\n", "libc.so.6"),

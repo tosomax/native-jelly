@@ -120,7 +120,7 @@ Full host suite: `make check` (queues on the machine-wide check lock).
   host) or a missing exact exported symbol; no `|| true` can turn either into a skip. Both gates
   print the `readelf` row they read when they fail.
 * `ci/check-platformfix-elf.py pkg/libplatformfix.so` gates the actual ARM artifact's ELF32/ARMv7
-  soft-float identity, exact unversioned `GLOBAL/DEFAULT` definition, `DT_NEEDED`, the documented
+  soft-float identity, exact mangled `GLOBAL/DEFAULT` definition (a `@version` suffix is tolerated), `DT_NEEDED`, the documented
   `GLIBCXX_3.4.21` ceiling and le requisiti CXXABI/GCC rilevati. Its canned-readelf regression test
   needs no compiler.
 * The firmware matrix grades `pkg/libplatformfix.so` with `--shipped pkg` alongside the bundled
